@@ -1833,7 +1833,9 @@ def slime_validate_args(args):
             args.start_rollout_id = 0
 
     if args.eval_interval is not None:
-        assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
+        assert args.eval_datasets or args.eval_function_path is not None, (
+            "Evaluation datasets or a custom eval function must be configured when eval_interval is set."
+        )
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
