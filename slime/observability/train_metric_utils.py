@@ -1,4 +1,5 @@
 import logging
+import math
 from argparse import Namespace
 from copy import deepcopy
 
@@ -56,7 +57,64 @@ def reduce_train_step_metrics(
     else:
         num_samples_or_tokens = step_global_batch_size
         cp_factor = 1
-    return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
+    metrics = {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
+    sum_scale = num_samples_or_tokens / cp_factor
+    finalize_value_head_stats(metrics, sum_scale)
+    finalize_policy_stats(metrics, sum_scale)
+    return metrics
+
+
+_VALUE_STAT_KEYS = (
+    "_value_stat_count",
+    "_value_stat_return_sum",
+    "_value_stat_return_sq_sum",
+    "_value_stat_residual_sum",
+    "_value_stat_residual_sq_sum",
+    "_value_stat_value_sq_sum",
+)
+
+
+def finalize_value_head_stats(metrics: dict[str, float], sum_scale: float) -> None:
+    """Fold global value-loss sufficient statistics into critic-health metrics."""
+    if not all(key in metrics for key in _VALUE_STAT_KEYS):
+        return
+    count, ret_sum, ret_sq_sum, res_sum, res_sq_sum, value_sq_sum = (
+        metrics.pop(key) * sum_scale for key in _VALUE_STAT_KEYS
+    )
+    if count < 2:
+        return
+    ret_mean = ret_sum / count
+    res_mean = res_sum / count
+    value_mean = ret_mean + res_mean
+    ret_var = max(ret_sq_sum / count - ret_mean**2, 0.0)
+    res_var = max(res_sq_sum / count - res_mean**2, 0.0)
+    value_var = max(value_sq_sum / count - value_mean**2, 0.0)
+    metrics["value_explained_variance"] = 1.0 - res_var / ret_var if ret_var > 1e-8 else 0.0
+    metrics["value_bias"] = res_mean
+    metrics["value_std"] = math.sqrt(value_var)
+    metrics["return_std"] = math.sqrt(ret_var)
+
+
+_POLICY_STAT_KEYS = (
+    "_policy_stat_count",
+    "_policy_stat_is_sum",
+    "_policy_stat_is_sq_sum",
+)
+
+
+def finalize_policy_stats(metrics: dict[str, float], sum_scale: float) -> None:
+    """Fold global importance-weight sums into the normalized ESS ratio."""
+    if not all(key in metrics for key in _POLICY_STAT_KEYS):
+        return
+    count, weight_sum, weight_sq_sum = (
+        metrics.pop(key) * sum_scale for key in _POLICY_STAT_KEYS
+    )
+    finite = all(math.isfinite(value) for value in (count, weight_sum, weight_sq_sum))
+    metrics["ess_ratio"] = (
+        weight_sum**2 / (count * weight_sq_sum)
+        if finite and count > 0 and weight_sq_sum > 0
+        else 0.0
+    )
 
 
 def rollout_log_metric_contribution(

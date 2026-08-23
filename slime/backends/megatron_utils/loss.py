@@ -701,6 +701,61 @@ def apply_opd_kl_to_advantages(
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
+@torch.no_grad()
+def store_value_diagnostics(
+    rollout_data: RolloutBatch,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    values: list[torch.Tensor],
+    returns: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> None:
+    """Store per-sample critic diagnostics on ``rollout_data``.
+
+    Works on the full (CP-gathered) per-token tensors, so every CP rank stores
+    identical python floats and both ``log_rollout_data``'s generic list path
+    and the train debug dump consume them as ordinary per-sample columns. The
+    terminal token is tracked separately because that is where GAE(λ<1)
+    concentrates critic bias and what steers stop/continue behavior. Before
+    whitening A = R − V, so raw-advantage statistics are these residuals
+    negated and need no column of their own.
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+
+    columns = {
+        "value_terminal": [],
+        "value_terminal_residual": [],
+        "value_first_residual": [],
+        "value_residual": [],
+        "value_residual_abs": [],
+        "value_residual_std": [],
+    }
+    for total_length, response_length, value, ret, loss_mask in zip(
+        total_lengths, response_lengths, values, returns, loss_masks, strict=True
+    ):
+        if cp_size > 1:
+            value = all_gather_with_cp(value, total_length, response_length)
+            ret = all_gather_with_cp(ret, total_length, response_length)
+        mask = loss_mask.to(device=value.device, dtype=torch.bool)
+        (trainable,) = mask.nonzero(as_tuple=True)
+        if trainable.numel() == 0:
+            # Keep the columns sample-aligned; a fully-masked sample carries no
+            # critic signal.
+            for column in columns.values():
+                column.append(0.0)
+            continue
+        residual = (value - ret)[mask]
+        first, last = trainable[0], trainable[-1]
+        columns["value_terminal"].append(value[last].item())
+        columns["value_terminal_residual"].append((value[last] - ret[last]).item())
+        columns["value_first_residual"].append((value[first] - ret[first]).item())
+        columns["value_residual"].append(residual.mean().item())
+        columns["value_residual_abs"].append(residual.abs().mean().item())
+        columns["value_residual_std"].append(residual.std(correction=0).item() if residual.numel() > 1 else 0.0)
+
+    rollout_data.update(columns)
+
+
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
@@ -805,6 +860,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
+
+    if values is not None:
+        store_value_diagnostics(rollout_data, total_lengths, response_lengths, values, returns, loss_masks)
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
     if args.use_opd:
@@ -1032,6 +1090,9 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
+    # ESS is diagnostic-only; saturate extreme ratios before exp/square can overflow.
+    importance_weights = (-ppo_kl.detach().float()).clamp(-20.0, 20.0).exp()
+
     if args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, args.eps_clip, args.eps_clip_high)
     else:
@@ -1134,10 +1195,21 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
+    train_rollout_kl = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         log_probs_to_compare = log_probs if args.use_rollout_logprobs else old_log_probs
         train_rollout_logprob_abs_diff = sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
+        train_rollout_kl = sum_of_sample_mean(
+            compute_approx_kl(rollout_log_probs, log_probs_to_compare, kl_loss_type="low_var_kl")
+        )
+
+    sum_of_token = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        batch["loss_masks"],
+        calculate_per_token_loss=True,
+    )
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1145,10 +1217,14 @@ def policy_loss_function(
         "entropy_loss": entropy_loss.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
+        "_policy_stat_count": sum_of_token(torch.ones_like(importance_weights)),
+        "_policy_stat_is_sum": sum_of_token(importance_weights),
+        "_policy_stat_is_sq_sum": sum_of_token(importance_weights.square()),
     }
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+        reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
@@ -1226,6 +1302,30 @@ def value_loss_function(
         "value_loss": loss.clone().detach(),
         "value_clipfrac": values_clipfrac.clone().detach(),
     }
+
+    # Critic-health sufficient statistics (count / Σx / Σx²) over loss-masked
+    # tokens. A local Var() would be biased across micro-batches and DP/CP
+    # shards, so the raw sums are reported instead and
+    # ``finalize_value_head_stats`` reconstructs explained variance / bias /
+    # stds after the cross-rank all-reduce.
+    with torch.no_grad():
+        sum_of_token = get_sum_of_sample_mean(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            calculate_per_token_loss=True,
+        )
+        residual = values - returns
+        reported_loss.update(
+            {
+                "_value_stat_count": sum_of_token(torch.ones_like(returns)),
+                "_value_stat_return_sum": sum_of_token(returns),
+                "_value_stat_return_sq_sum": sum_of_token(returns.square()),
+                "_value_stat_residual_sum": sum_of_token(residual),
+                "_value_stat_residual_sq_sum": sum_of_token(residual.square()),
+                "_value_stat_value_sq_sum": sum_of_token(values.square()),
+            }
+        )
 
     return loss, reported_loss
 

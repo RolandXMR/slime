@@ -321,3 +321,241 @@ def test_train_one_step_per_token_loss_report_invariant_to_cp(monkeypatch, mock_
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+# ---------------------------------------------------------------------------
+# Value-head sufficient statistics: value_loss_function reports raw masked
+# sums (count / Σx / Σx²) under ``_value_stat_*`` keys, and
+# ``reduce_train_step_metrics`` → ``finalize_value_head_stats`` reconstructs
+# explained variance / bias / stds from them after the all-reduce. The tests
+# pin that the reconstruction equals a direct full-batch computation, in both
+# reporting modes and independent of mb splits.
+# ---------------------------------------------------------------------------
+
+_VS_RETURNS = [
+    torch.tensor([1.0, 2.0, 3.0]),
+    torch.tensor([4.0, 5.0, 6.0]),
+    torch.tensor([7.0, 8.0, 9.0]),
+    torch.tensor([10.0, 11.0, 12.0]),
+]
+_VS_VALUES = [
+    torch.tensor([1.5, 1.5, 3.5]),
+    torch.tensor([3.0, 5.5, 5.0]),
+    torch.tensor([8.0, 7.0, 10.0]),
+    torch.tensor([9.0, 12.0, 11.5]),
+]
+# One masked token exercises that the stats honor the loss mask.
+_VS_LOSS_MASKS = [
+    torch.tensor([1.0, 1.0, 1.0]),
+    torch.tensor([1.0, 0.0, 1.0]),
+    torch.tensor([1.0, 1.0, 1.0]),
+    torch.tensor([1.0, 1.0, 1.0]),
+]
+
+
+def _vs_reference() -> dict[str, float]:
+    """Direct full-batch computation of the reconstructed metrics."""
+    active = torch.cat(_VS_LOSS_MASKS).bool()
+    returns = torch.cat(_VS_RETURNS)[active]
+    values = torch.cat(_VS_VALUES)[active]
+    residual = values - returns
+    return {
+        "value_explained_variance": (1.0 - residual.var(correction=0) / returns.var(correction=0)).item(),
+        "value_bias": residual.mean().item(),
+        "value_std": values.std(correction=0).item(),
+        "return_std": returns.std(correction=0).item(),
+    }
+
+
+def _vs_stat_values(mb_indices) -> dict[str, float]:
+    """The six sufficient statistics for one micro-batch, via the same reducer
+    value_loss_function uses (``calculate_per_token_loss=True`` → raw masked sums)."""
+    tl = [_FIXED_TOTAL_LENGTHS[i] for i in mb_indices]
+    rl = [3 for _ in mb_indices]
+    masks = [_VS_LOSS_MASKS[i] for i in mb_indices]
+    returns = torch.cat([_VS_RETURNS[i] for i in mb_indices])
+    values = torch.cat([_VS_VALUES[i] for i in mb_indices])
+    residual = values - returns
+    sum_of_token = get_sum_of_sample_mean(tl, rl, masks, calculate_per_token_loss=True)
+    return {
+        "_value_stat_count": sum_of_token(torch.ones_like(returns)).item(),
+        "_value_stat_return_sum": sum_of_token(returns).item(),
+        "_value_stat_return_sq_sum": sum_of_token(returns.square()).item(),
+        "_value_stat_residual_sum": sum_of_token(residual).item(),
+        "_value_stat_residual_sq_sum": sum_of_token(residual.square()).item(),
+        "_value_stat_value_sq_sum": sum_of_token(values.square()).item(),
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("partition", _PARTITION_CONFIGS)
+@pytest.mark.parametrize("per_token_loss", [False, True])
+def test_value_stats_reconstruction_matches_direct(partition, per_token_loss, mock_dp_with_cp_group):
+    """EV / bias / stds reconstructed from mb-summed sufficient statistics must
+    equal the direct full-batch numbers, regardless of the mb/DP split and of
+    which reporting mode scaled the sums on their way through."""
+    from slime.observability.train_metric_utils import finalize_value_head_stats  # noqa: F401  (re-export check)
+
+    losses_reduced = []
+    num_tokens_total = 0
+    for rank_mbs in partition:
+        for mb_indices in rank_mbs:
+            stats = _vs_stat_values(mb_indices)
+            # value_loss / value_clipfrac ride along like production does.
+            log = {"value_loss": 0.0, **stats}
+            num_tokens = sum(max(int(_VS_LOSS_MASKS[i].sum().item()), 1) for i in mb_indices)
+            num_tokens_total += num_tokens
+            losses_reduced.append(
+                {
+                    "keys": list(log.keys()),
+                    "values": torch.tensor(
+                        [num_tokens if per_token_loss else 0.0] + list(log.values()), dtype=torch.float64
+                    ),
+                }
+            )
+    reduced = reduce_train_step_metrics(
+        losses_reduced,
+        calculate_per_token_loss=per_token_loss,
+        step_global_batch_size=_FIXED_STEP_GBS,
+        cp_size=1,
+        dp_with_cp_group=mock_dp_with_cp_group,
+    )
+
+    for key, expected in _vs_reference().items():
+        assert reduced[key] == pytest.approx(expected, abs=1e-6), key
+    assert not any(key.startswith("_value_stat_") for key in reduced)
+
+
+@pytest.mark.unit
+def test_value_stats_reconstruction_invariant_to_cp(monkeypatch, mock_dp_with_cp_group):
+    """With CP, each rank contributes the sums of its zigzag chunks; the
+    all-reduced totals are the same global sums, and ``sum_scale`` inverts the
+    per-token scaling (which is CP-inflated) exactly."""
+    from megatron.core import mpu as _mpu
+
+    total_lengths = [12, 12]
+    response_lengths = [8, 8]
+    loss_masks = [
+        torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0]),
+    ]
+    returns = [torch.arange(1.0, 9.0), torch.arange(10.0, 80.0 + 1, 10.0)]
+    values = [r + torch.linspace(-1.0, 1.0, 8) for r in returns]
+
+    active = torch.cat(loss_masks).bool()
+    flat_returns = torch.cat(returns)[active]
+    flat_residual = (torch.cat(values) - torch.cat(returns))[active]
+    expected_ev = (1.0 - flat_residual.var(correction=0) / flat_returns.var(correction=0)).item()
+
+    def simulate(cp_size: int) -> float:
+        monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: cp_size)
+        stat_keys = (
+            "_value_stat_count",
+            "_value_stat_return_sum",
+            "_value_stat_return_sq_sum",
+            "_value_stat_residual_sum",
+            "_value_stat_residual_sq_sum",
+            "_value_stat_value_sq_sum",
+        )
+        sums = dict.fromkeys(stat_keys, 0.0)
+        num_tokens_per_rank = sum(max(int(m.sum().item()), 1) for m in loss_masks)
+        num_tokens_after_allreduce = 0
+        for cp_rank in range(cp_size):
+            monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda r=cp_rank: r)
+
+            def chunk(x_full):
+                if cp_size == 1:
+                    return torch.cat(x_full)
+                parts = []
+                for tl, rl, x in zip(total_lengths, response_lengths, x_full, strict=True):
+                    prompt_length = tl - rl
+                    _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(tl, rl)
+                    c0 = x[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
+                    c1 = x[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
+                    parts.append(torch.cat([c0, c1]))
+                return torch.cat(parts)
+
+            sum_of_token = get_sum_of_sample_mean(
+                total_lengths, response_lengths, loss_masks, calculate_per_token_loss=True
+            )
+            rank_returns = chunk(returns)
+            rank_values = chunk(values)
+            rank_residual = rank_values - rank_returns
+            sums["_value_stat_count"] += sum_of_token(torch.ones_like(rank_returns)).item()
+            sums["_value_stat_return_sum"] += sum_of_token(rank_returns).item()
+            sums["_value_stat_return_sq_sum"] += sum_of_token(rank_returns.square()).item()
+            sums["_value_stat_residual_sum"] += sum_of_token(rank_residual).item()
+            sums["_value_stat_residual_sq_sum"] += sum_of_token(rank_residual.square()).item()
+            sums["_value_stat_value_sq_sum"] += sum_of_token(rank_values.square()).item()
+            num_tokens_after_allreduce += num_tokens_per_rank
+
+        reduced = reduce_train_step_metrics(
+            [
+                {
+                    "keys": list(sums.keys()),
+                    "values": torch.tensor([num_tokens_after_allreduce] + list(sums.values()), dtype=torch.float64),
+                }
+            ],
+            calculate_per_token_loss=True,
+            step_global_batch_size=999,
+            cp_size=cp_size,
+            dp_with_cp_group=mock_dp_with_cp_group,
+        )
+        return reduced["value_explained_variance"]
+
+    assert simulate(1) == pytest.approx(expected_ev, abs=1e-6)
+    assert simulate(2) == pytest.approx(expected_ev, abs=1e-6)
+
+
+@pytest.mark.unit
+def test_finalize_value_head_stats_passthrough_without_stats():
+    """Policy-loss metrics (no ``_value_stat_*`` keys) must pass through untouched."""
+    from slime.observability.train_metric_utils import finalize_value_head_stats
+
+    metrics = {"pg_loss": 0.5, "ppo_kl": 0.01}
+    finalize_value_head_stats(dict(metrics), 4.0)
+    untouched = dict(metrics)
+    finalize_value_head_stats(untouched, 4.0)
+    assert untouched == metrics
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("per_token_loss", [False, True])
+def test_ess_ratio_reconstruction_matches_direct(per_token_loss, mock_dp_with_cp_group):
+    weights = torch.tensor([0.5, 1.0, 1.5, 2.0], dtype=torch.float64)
+    stats = {
+        "_policy_stat_count": float(weights.numel()),
+        "_policy_stat_is_sum": weights.sum().item(),
+        "_policy_stat_is_sq_sum": weights.square().sum().item(),
+    }
+    normalizer = weights.numel() if per_token_loss else 2
+    reduced = reduce_train_step_metrics(
+        [
+            {
+                "keys": list(stats),
+                "values": torch.tensor([normalizer if per_token_loss else 0.0, *stats.values()], dtype=torch.float64),
+            }
+        ],
+        calculate_per_token_loss=per_token_loss,
+        step_global_batch_size=normalizer,
+        cp_size=1,
+        dp_with_cp_group=mock_dp_with_cp_group,
+    )
+
+    expected = weights.sum().square() / (weights.numel() * weights.square().sum())
+    assert reduced["ess_ratio"] == pytest.approx(expected.item())
+    assert not any(key.startswith("_policy_stat_") for key in reduced)
+
+
+@pytest.mark.unit
+def test_ess_ratio_rejects_non_finite_stats():
+    from slime.observability.train_metric_utils import finalize_policy_stats
+
+    metrics = {
+        "_policy_stat_count": 2.0,
+        "_policy_stat_is_sum": float("inf"),
+        "_policy_stat_is_sq_sum": float("inf"),
+    }
+    finalize_policy_stats(metrics, 1.0)
+
+    assert metrics == {"ess_ratio": 0.0}

@@ -404,6 +404,15 @@ class MegatronTrainRayActor(TrainRayActor):
 
         compute_advantages_and_returns(self.args, rollout_data)
 
+        # Warmup steps skip train_actor entirely, so the actor-side rollout
+        # logging and train debug dump would leave them blind; surface both from
+        # the critic on exactly those steps (no overlap with the actor's).
+        if rollout_id < self.args.num_critic_only_steps:
+            if self.rollout_data_postprocess is not None:
+                self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
+            train_metric_utils.log_rollout_data(rollout_id, self.args, rollout_data)
+            train_data_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+
         self.args.loss_type = "value_loss"
         train(
             rollout_id,
