@@ -113,6 +113,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
         start_rollout_id = loaded_rollout_id + 1
 
+        # Set before the critic's early return: train_critic() reads this on
+        # num_critic_only_steps warmup steps, where train_actor never runs.
+        self.rollout_data_postprocess = None
+        if self.args.rollout_data_postprocess_path is not None:
+            from slime.utils.misc import load_function
+
+            self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
+
         if role == "critic":
             if self.args.offload_train:
                 self.sleep()
@@ -191,12 +199,6 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
         self.rollout_engines = None
-
-        self.rollout_data_postprocess = None
-        if self.args.rollout_data_postprocess_path is not None:
-            from slime.utils.misc import load_function
-
-            self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
 
         self.prof.on_init_end()
 

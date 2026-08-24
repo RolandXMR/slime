@@ -1643,6 +1643,40 @@ def parse_args(add_custom_arguments=None):
     return args
 
 
+def _apply_load_fallback(args):
+    """If args.load is not a usable checkpoint, fall back to ref_load (fresh start).
+
+    Called on the base args at CLI-parse time, and re-run for the critic in
+    parse_megatron_role_args: a yaml `load:` override pointing at the critic's
+    own save dir cannot exist on a first run and would otherwise overwrite the
+    fallback that already ran on the base args, tripping the load assert.
+    """
+    load_is_megatron = (
+        args.load is not None
+        and os.path.exists(args.load)
+        and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+    )
+    load_is_hf = (
+        args.load is not None and os.path.isdir(args.load) and os.path.exists(os.path.join(args.load, "config.json"))
+    )
+    if load_is_hf:
+        from slime.backends.megatron_utils.hf_to_megatron import supports_hf_weight_loading
+
+        load_is_hf = supports_hf_weight_loading(args.load)
+    if not load_is_megatron:
+        args.no_load_optim = True
+        args.no_load_rng = True
+        args.finetune = True
+        if not load_is_hf:
+            if args.load is not None and args.load != args.ref_load:
+                logger.info(f"load={args.load} is not a usable checkpoint; falling back to ref_load={args.ref_load}.")
+            args.load = args.ref_load
+        if args.ref_ckpt_step is not None:
+            args.ckpt_step = args.ref_ckpt_step
+        if args.start_rollout_id is None:
+            args.start_rollout_id = 0
+
+
 def _apply_megatron_role_overrides(base_args, overrides, role):
     role_args = copy.deepcopy(base_args)
     ignored_keys = {"num_nodes", "num_gpus_per_node"}
@@ -1714,6 +1748,11 @@ def parse_megatron_role_args(base_args, megatron_config_path, role):
         )
 
     role_args = _apply_megatron_role_overrides(base_args, overrides, role)
+    if role == "critic" and "load" in overrides:
+        # The base args' load fallback ran before this override was applied;
+        # re-run it so a critic load dir that does not exist yet (fresh run)
+        # falls back to ref_load (value head is reinitialized on load).
+        _apply_load_fallback(role_args)
     logger.info(
         f"Parsed megatron config for role={role} from {megatron_config_path}: overrides = {list(overrides.keys())}"
     )
@@ -1814,28 +1853,7 @@ def slime_validate_args(args):
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
 
-    load_is_megatron = (
-        args.load is not None
-        and os.path.exists(args.load)
-        and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-    )
-    load_is_hf = (
-        args.load is not None and os.path.isdir(args.load) and os.path.exists(os.path.join(args.load, "config.json"))
-    )
-    if load_is_hf:
-        from slime.backends.megatron_utils.hf_to_megatron import supports_hf_weight_loading
-
-        load_is_hf = supports_hf_weight_loading(args.load)
-    if not load_is_megatron:
-        args.no_load_optim = True
-        args.no_load_rng = True
-        args.finetune = True
-        if not load_is_hf:
-            args.load = args.ref_load
-        if args.ref_ckpt_step is not None:
-            args.ckpt_step = args.ref_ckpt_step
-        if args.start_rollout_id is None:
-            args.start_rollout_id = 0
+    _apply_load_fallback(args)
 
     if args.eval_interval is not None:
         assert args.eval_datasets or args.eval_function_path is not None, (
