@@ -305,6 +305,13 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
+    if role == "actor" and getattr(args, "fp32_lm_head", False):
+        from .fp32_lm_head import install_fp32_lm_head_hook
+
+        # The hook runs inside Float16Module, after the bf16 cast and before DDP
+        # records parameter dtypes.
+        install_fp32_lm_head_hook()
+
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     if args.num_rollout == 0:

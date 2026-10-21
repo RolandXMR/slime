@@ -251,6 +251,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fp32-lm-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Keep the actor vocabulary head in fp32 and run its GEMM in fp32. "
+                    "The rest of the model stays at the bf16 training dtype. Tied checkpoints "
+                    "get a separate head initialized from the token embedding, which stays bf16. "
+                    "Rollout engines receive a bf16 copy of the head."
+                ),
+            )
+            parser.add_argument(
                 "--custom-model-provider-path",
                 type=str,
                 default=None,
@@ -1945,6 +1956,11 @@ def slime_validate_args(args):
     from slime.utils.score_centering import validate_score_centering_args
 
     args = copy.deepcopy(args)
+    if getattr(args, "fp32_lm_head", False):
+        # Applied again in megatron_parse_args before HF validation. Repeated here so
+        # callers that build the model from an already-parsed namespace still untie.
+        args.untie_embeddings_and_output_weights = True
+
     if getattr(args, "rollout_cleanup_timeout", 60) <= 0:
         raise ValueError("--rollout-cleanup-timeout must be positive")
     get_pg_loss_type(args)

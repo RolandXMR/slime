@@ -218,6 +218,15 @@ class SGLangEngine(RayActor):
         server_args_dict["json_model_override_args"] = sglang_model_config_overrides(
             server_args_dict["model_path"], server_args_dict.get("json_model_override_args", "{}")
         )
+        if getattr(self.args, "fp32_lm_head", False):
+            from slime.backends.megatron_utils.fp32_lm_head import untie_rollout_embeddings
+            from slime.utils.model_config import load_hf_config
+
+            text_config = getattr(load_hf_config(server_args_dict["model_path"]), "text_config", None)
+            server_args_dict["json_model_override_args"] = untie_rollout_embeddings(
+                server_args_dict["json_model_override_args"],
+                has_text_config=text_config is not None,
+            )
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         executable = getattr(self.args, "sglang_python_executable", None)
         if executable:
