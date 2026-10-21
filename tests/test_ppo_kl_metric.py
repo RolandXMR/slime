@@ -2,6 +2,7 @@ import sys
 import types
 from argparse import Namespace
 
+import pytest
 import torch
 
 from slime.utils.ppo_utils import compute_approx_kl
@@ -120,3 +121,7 @@ def test_policy_loss_reports_train_rollout_kl(monkeypatch):
     expected = compute_approx_kl(rollout[0], old[0], kl_loss_type="low_var_kl").mean()
     torch.testing.assert_close(metrics["train_rollout_kl"], expected)
     assert {"_policy_stat_count", "_policy_stat_is_sum", "_policy_stat_is_sq_sum"} <= metrics.keys()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

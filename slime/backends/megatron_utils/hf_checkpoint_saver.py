@@ -30,26 +30,6 @@ def save_hf_model_to_path(
     quantization_config: dict[str, Any] | None = None,
     progress_desc: str = "Save HF checkpoint",
 ) -> None:
-    """Save a Megatron model as an HF checkpoint at a concrete directory."""
-    save_hf_model_direct_to_path(
-        args,
-        output_dir,
-        model,
-        model_name=model_name,
-        quantization_config=quantization_config,
-        progress_desc=progress_desc,
-    )
-
-
-def save_hf_model_direct_to_path(
-    args,
-    output_dir: str | Path,
-    model,
-    *,
-    model_name: str | None = None,
-    quantization_config: dict[str, Any] | None = None,
-    progress_desc: str = "Save HF checkpoint",
-) -> None:
     """Save a Megatron model as an HF safetensors checkpoint."""
     path = Path(output_dir)
     hf_checkpoint = Path(args.hf_checkpoint).resolve()
@@ -62,7 +42,8 @@ def save_hf_model_direct_to_path(
         )
 
     import torch.distributed as dist
-    from transformers import AutoConfig
+
+    from slime.utils.model_config import load_hf_config
 
     from .update_weight.common import named_params_and_buffers
     from .update_weight.hf_weight_iterator_direct import HfWeightIteratorDirect
@@ -88,7 +69,7 @@ def save_hf_model_direct_to_path(
     else:
         if is_save_rank:
             try:
-                hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True)
                 payload = [
                     (
                         type(hf_config).__name__.lower() if args.model_name is None else args.model_name,
@@ -110,7 +91,7 @@ def save_hf_model_direct_to_path(
         quantization_config=quantization_config,
         transform_ue8m0=False,
     )
-    megatron_local_weights = dict(named_params_and_buffers(args, model, convert_to_global_name=True))
+    megatron_local_weights = dict(named_params_and_buffers(args, model))
     num_save_nodes, save_node_rank, is_writer_rank, writer_ranks = _get_node_save_layout(args)
     if is_save_rank:
         logger.info(

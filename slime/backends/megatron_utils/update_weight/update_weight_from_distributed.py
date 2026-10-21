@@ -16,6 +16,7 @@ from tqdm import tqdm
 from slime.utils import accelerator
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.http_utils import _wrap_ipv6
+from slime.utils.weight_sync import should_flush_cache
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
@@ -83,7 +84,7 @@ class UpdateWeightFromDistributed:
         if self._is_pp_src_rank:
             if self._model_update_groups is not None:
                 disconnect_rollout_engines_from_distributed(
-                    self.args, self._group_name, self._model_update_groups, self.rollout_engines
+                    self._group_name, self._model_update_groups, self.rollout_engines
                 )
             self._model_update_groups = connect_rollout_engines_from_distributed(
                 self.args,
@@ -95,21 +96,28 @@ class UpdateWeightFromDistributed:
     def disconnect_rollout_engines(self) -> None:
         if not getattr(self, "_is_pp_src_rank", False) or self._model_update_groups is None:
             return
-        disconnect_rollout_engines_from_distributed(
-            self.args, self._group_name, self._model_update_groups, self.rollout_engines
-        )
+        disconnect_rollout_engines_from_distributed(self._group_name, self._model_update_groups, self.rollout_engines)
         self._model_update_groups = None
 
     @torch.no_grad()
     def update_weights(self) -> None:
         """
-        Pause → flush → _send_weights → continue. Progress on PP source.
+        Pause → optionally flush → _send_weights → continue. Progress on PP source.
         """
         self.weight_version += 1
+        flush_cache = should_flush_cache(
+            self.args.flush_cache_interval, self.weight_version, getattr(self.args, "update_weight_start_version", 0)
+        )
 
         if dist.get_rank() == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            ray.get(
+                [
+                    engine.pause_generation.remote(mode="abort" if flush_cache else "in_place")
+                    for engine in self.rollout_engines
+                ]
+            )
+            if flush_cache:
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
             # int4/fp4 pre_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
@@ -316,7 +324,7 @@ def connect_rollout_engines_from_distributed(
     return model_update_groups
 
 
-def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines):
+def disconnect_rollout_engines_from_distributed(group_name, model_update_groups, rollout_engines):
     """
     Destroy the weight-update process group on training and engines.
     """
