@@ -323,7 +323,8 @@ def _clear_existing_hf_weights(path: Path) -> None:
             item.unlink()
 
 
-def _copy_hf_assets(origin_hf_dir: str, output_dir: Path, *, untie_embeddings: bool = False) -> None:
+def _copy_hf_assets(origin_hf_dir: str, output_dir: str | Path, *, untie_embeddings: bool = False) -> None:
+    output_dir = Path(output_dir)
     origin = Path(origin_hf_dir)
     if not origin.is_dir():
         raise ValueError(f"--hf-checkpoint must be a local directory when using raw --save-hf: {origin_hf_dir}")
@@ -335,18 +336,13 @@ def _copy_hf_assets(origin_hf_dir: str, output_dir: Path, *, untie_embeddings: b
             shutil.copy2(item, output_dir / item.name)
 
     if untie_embeddings:
-        _untie_hf_config(output_dir)
-
-
-def _untie_hf_config(output_dir: str | Path) -> None:
-    """Persist the separate head created from a tied pretrained checkpoint."""
-    config_path = Path(output_dir) / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["tie_word_embeddings"] = False
-    text_config = config.get("text_config")
-    if isinstance(text_config, dict):
-        text_config["tie_word_embeddings"] = False
-    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        config_path = output_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["tie_word_embeddings"] = False
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            text_config["tie_word_embeddings"] = False
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
 def _is_hf_weight_file(path: Path) -> bool:

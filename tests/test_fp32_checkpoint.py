@@ -134,7 +134,27 @@ def test_fp32_untied_checkpoint_keeps_optimizer_resume():
         ),
     }
     state = {"model": {}, "optimizer": {"state": "unchanged"}}
-    assert _prepare_fp32_head_load(state, metadata, SimpleNamespace(untie_embeddings_and_output_weights=True)) == state
+    assert _prepare_fp32_head_load(state, metadata, SimpleNamespace(untie_embeddings_and_output_weights=True)) is state
+
+
+def test_fp32_actor_flag_does_not_change_critic_checkpoint_loading(tmp_path, monkeypatch):
+    # A critic's value head is never promoted. In particular, its saved args
+    # may still describe tied embeddings; that must not block optimizer resume.
+    from slime.backends.megatron_utils import checkpoint
+
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
+    args = SimpleNamespace(load=str(tmp_path), fp32_lm_head=True, finetune=False)
+    optimizer = object()
+    calls = []
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kwargs: (calls.append(kwargs) or (7, 0)))
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.fp32_checkpoint.fp32_head_checkpoint_loading",
+        lambda **kwargs: pytest.fail("FP32 vocabulary-head migration must not run for the critic"),
+    )
+
+    assert checkpoint.load_checkpoint([SimpleNamespace(role="critic")], optimizer, None, {}) == (7, 0)
+    assert calls[0]["optimizer"] is optimizer
 
 
 def test_missing_untied_head_is_not_repaired_as_tied():

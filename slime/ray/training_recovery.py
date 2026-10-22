@@ -71,6 +71,7 @@ def retained_rollout_configuration(args):
         "finetune",
         "no_load_optim",
         "no_load_rng",
+        "_load_fallback_options",
         "save_interval",
         "num_rollout",
         "num_epoch",

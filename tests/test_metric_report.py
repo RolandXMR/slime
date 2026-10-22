@@ -16,6 +16,8 @@ end-to-end variants (real torch.distributed) live in
 
 from __future__ import annotations
 
+from argparse import Namespace
+
 # Import the helpers BEFORE the slime imports so the megatron stub lands
 # in sys.modules first. pytest's prepend importmode puts this file's
 # directory (``tests/``) on sys.path, which is what makes the bare-name
@@ -32,6 +34,7 @@ from slime.observability.train_metric_utils import (  # noqa: E402
     reduce_train_step_metrics,
     rollout_log_metric_contribution,
 )
+from slime.utils.ppo_utils import compute_approx_kl
 
 NUM_GPUS = 0
 
@@ -365,10 +368,6 @@ def test_train_one_step_per_token_loss_report_invariant_to_cp(monkeypatch, mock_
     assert simulate(1) == pytest.approx(simulate(2))
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
-
-
 # ---------------------------------------------------------------------------
 # Value-head sufficient statistics: value_loss_function reports raw masked
 # sums (count / Σx / Σx²) under ``_value_stat_*`` keys, and
@@ -440,17 +439,13 @@ def test_value_stats_reconstruction_matches_direct(partition, per_token_loss, mo
     """EV / bias / stds reconstructed from mb-summed sufficient statistics must
     equal the direct full-batch numbers, regardless of the mb/DP split and of
     which reporting mode scaled the sums on their way through."""
-    from slime.observability.train_metric_utils import finalize_value_head_stats  # noqa: F401  (re-export check)
-
     losses_reduced = []
-    num_tokens_total = 0
     for rank_mbs in partition:
         for mb_indices in rank_mbs:
             stats = _vs_stat_values(mb_indices)
             # value_loss / value_clipfrac ride along like production does.
             log = {"value_loss": 0.0, **stats}
             num_tokens = sum(max(int(_VS_LOSS_MASKS[i].sum().item()), 1) for i in mb_indices)
-            num_tokens_total += num_tokens
             losses_reduced.append(
                 {
                     "keys": list(log.keys()),
@@ -475,8 +470,8 @@ def test_value_stats_reconstruction_matches_direct(partition, per_token_loss, mo
 @pytest.mark.unit
 def test_value_stats_reconstruction_invariant_to_cp(monkeypatch, mock_dp_with_cp_group):
     """With CP, each rank contributes the sums of its zigzag chunks; the
-    all-reduced totals are the same global sums, and ``sum_scale`` inverts the
-    per-token scaling (which is CP-inflated) exactly."""
+    all-reduced totals have the same ratios, even after the common reporting
+    normalizer is applied."""
     from megatron.core import mpu as _mpu
 
     total_lengths = [12, 12]
@@ -559,9 +554,8 @@ def test_finalize_value_head_stats_passthrough_without_stats():
     from slime.observability.train_metric_utils import finalize_value_head_stats
 
     metrics = {"pg_loss": 0.5, "ppo_kl": 0.01}
-    finalize_value_head_stats(dict(metrics), 4.0)
     untouched = dict(metrics)
-    finalize_value_head_stats(untouched, 4.0)
+    finalize_value_head_stats(untouched)
     assert untouched == metrics
 
 
@@ -602,6 +596,209 @@ def test_ess_ratio_rejects_non_finite_stats():
         "_policy_stat_is_sum": float("inf"),
         "_policy_stat_is_sq_sum": float("inf"),
     }
-    finalize_policy_stats(metrics, 1.0)
+    finalize_policy_stats(metrics)
 
     assert metrics == {"ess_ratio": 0.0}
+
+
+@pytest.fixture
+def cp_disabled(monkeypatch):
+    from megatron.core import mpu
+
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+
+
+@pytest.mark.unit
+def test_store_value_diagnostics_columns(cp_disabled):
+    from slime.backends.megatron_utils.loss import store_value_diagnostics
+
+    rollout_data = {}
+    values = [torch.tensor([1.0, 2.0, 3.0, 4.0]), torch.tensor([5.0, 6.0])]
+    returns = [torch.tensor([1.5, 1.0, 3.5, 3.0]), torch.tensor([5.0, 8.0])]
+    # Sample 0 has a masked (tool-observation) token; sample 1's first token is masked.
+    loss_masks = [torch.tensor([1.0, 0.0, 1.0, 1.0]), torch.tensor([0.0, 1.0])]
+    store_value_diagnostics(rollout_data, [8, 6], [4, 2], values, returns, loss_masks)
+
+    assert rollout_data["value_terminal"] == [4.0, 6.0]
+    assert rollout_data["value_terminal_residual"] == [1.0, -2.0]
+    # First trainable token, not first response token: sample 1 starts at index 1.
+    assert rollout_data["value_first_residual"] == [-0.5, -2.0]
+    # Sample 0 masked residuals [-0.5, -0.5, 1.0]: mean 0, |·| mean 2/3, std sqrt(1/2).
+    assert rollout_data["value_residual"][0] == pytest.approx(0.0)
+    assert rollout_data["value_residual_abs"][0] == pytest.approx(2.0 / 3.0)
+    assert rollout_data["value_residual_std"][0] == pytest.approx(0.5**0.5)
+    # A single trainable token has no spread.
+    assert rollout_data["value_residual_std"][1] == 0.0
+
+
+@pytest.mark.unit
+def test_store_value_diagnostics_all_masked_sample_stays_aligned(cp_disabled):
+    from slime.backends.megatron_utils.loss import store_value_diagnostics
+
+    rollout_data = {}
+    store_value_diagnostics(
+        rollout_data,
+        [4, 5],
+        [2, 3],
+        [torch.tensor([1.0, 2.0]), torch.tensor([1.0, 2.0, 3.0])],
+        [torch.tensor([9.0, 9.0]), torch.tensor([1.0, 2.0, 4.0])],
+        [torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0, 1.0])],
+    )
+    # The fully-masked sample contributes zeros, keeping every column per-sample aligned.
+    assert rollout_data["value_terminal"] == [0.0, 3.0]
+    assert rollout_data["value_terminal_residual"] == [0.0, -1.0]
+    assert all(len(column) == 2 for column in rollout_data.values())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("store_diagnostics", [False, True])
+def test_custom_advantage_path_stores_value_diagnostics(cp_disabled, monkeypatch, store_diagnostics):
+    from slime.backends.megatron_utils import loss as loss_module
+
+    def custom_advantage(_args, rollout_data):
+        rollout_data["advantages"] = [torch.tensor([0.5, -0.5])]
+        rollout_data["returns"] = [torch.tensor([1.5, 1.0])]
+
+    monkeypatch.setattr(loss_module, "load_function", lambda _path: custom_advantage)
+    if not store_diagnostics:
+        monkeypatch.setattr(
+            loss_module, "store_value_diagnostics", lambda *_: pytest.fail("unused diagnostics must be skipped")
+        )
+    rollout_data = {
+        "log_probs": [torch.tensor([-0.2, -0.3])],
+        "ref_log_probs": None,
+        "rewards": [1.0],
+        "values": [torch.tensor([1.0, 2.0])],
+        "response_lengths": [2],
+        "total_lengths": [4],
+        "loss_masks": [torch.ones(2)],
+    }
+    args = Namespace(
+        use_rollout_logprobs=False,
+        kl_coef=0.0,
+        kl_loss_type="k1",
+        custom_advantage_function_path="custom",
+        use_opd=False,
+        normalize_advantages=False,
+    )
+
+    loss_module.compute_advantages_and_returns(args, rollout_data, store_diagnostics=store_diagnostics)
+
+    torch.testing.assert_close(rollout_data["advantages"][0], torch.tensor([0.5, -0.5]))
+    torch.testing.assert_close(rollout_data["returns"][0], torch.tensor([1.5, 1.0]))
+    if store_diagnostics:
+        assert rollout_data["value_terminal"] == [2.0]
+        assert rollout_data["value_terminal_residual"] == [1.0]
+        assert rollout_data["value_residual"] == pytest.approx([0.25])
+    else:
+        assert "value_terminal" not in rollout_data
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("count", [0.0, 1.0])
+def test_value_stats_empty_and_single_active_token(count):
+    from slime.observability.train_metric_utils import finalize_value_head_stats
+
+    metrics = {
+        "_value_stat_count": count,
+        "_value_stat_return_sum": count * 2.0,
+        "_value_stat_return_sq_sum": count * 4.0,
+        "_value_stat_residual_sum": count,
+        "_value_stat_residual_sq_sum": count,
+        "_value_stat_value_sq_sum": count * 9.0,
+    }
+    finalize_value_head_stats(metrics)
+
+    assert metrics == (
+        {"value_explained_variance": 0.0, "value_bias": 1.0, "value_std": 0.0, "return_std": 0.0} if count else {}
+    )
+
+
+def test_ppo_estimator_does_not_corrupt_logged_kl(cp_disabled):
+    from slime.backends.megatron_utils.loss import compute_advantages_and_returns
+
+    log_probs = [torch.tensor([0.5, 0.7, 0.9])]
+    ref_log_probs = [torch.tensor([0.4, 0.5, 0.6])]
+    expected_kl = compute_approx_kl(log_probs[0], ref_log_probs[0], kl_loss_type="k1")
+    rollout_data = {
+        "log_probs": log_probs,
+        "ref_log_probs": ref_log_probs,
+        "rewards": [1.0],
+        "values": [torch.zeros(3)],
+        "response_lengths": [3],
+        "total_lengths": [5],
+        "loss_masks": [torch.ones(3)],
+    }
+    args = Namespace(
+        advantage_estimator="ppo",
+        kl_coef=0.05,
+        kl_loss_type="k1",
+        use_rollout_logprobs=False,
+        custom_advantage_function_path=None,
+        normalize_advantages=False,
+        use_opd=False,
+        gamma=1.0,
+        lambd=1.0,
+    )
+    compute_advantages_and_returns(args, rollout_data)
+    torch.testing.assert_close(rollout_data["kl"][0], expected_kl)
+
+
+@pytest.mark.parametrize("log_ratios", [[0.1, 0.1], [25.0, 30.0]])
+def test_policy_loss_reports_train_rollout_kl_and_ess(cp_disabled, monkeypatch, log_ratios):
+    from slime.backends.megatron_utils import loss as loss_module
+    from slime.observability.train_metric_utils import finalize_policy_stats
+
+    current = [torch.tensor([-0.2, -0.4], requires_grad=True)]
+    old = [current[0].detach() - torch.tensor(log_ratios)]
+    rollout = [torch.tensor([-0.35, -0.45])]
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *_args, **_kwargs: (None, {"log_probs": current, "entropy": [torch.zeros(2)]}),
+    )
+    args = Namespace(
+        use_rollout_logprobs=False,
+        rollout_top_p=1.0,
+        advantage_estimator="ppo",
+        use_opsm=False,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        eps_clip_c=None,
+        get_mismatch_metrics=False,
+        use_tis=False,
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=0.0,
+        use_kl_loss=False,
+        use_opd=False,
+    )
+    batch = {
+        "advantages": [torch.ones(2)],
+        "log_probs": old,
+        "rollout_log_probs": rollout,
+        "unconcat_tokens": [torch.tensor([1, 2, 3, 4])],
+        "response_lengths": [2],
+        "total_lengths": [4],
+        "loss_masks": [torch.ones(2)],
+        "rollout_mask_sums": torch.tensor([2.0]),
+    }
+
+    def reducer(value):
+        return value.mean()
+
+    _, metrics = loss_module.policy_loss_function(args, batch, torch.zeros(1, 1, 1), reducer)
+
+    expected = compute_approx_kl(rollout[0], old[0], kl_loss_type="low_var_kl").mean()
+    torch.testing.assert_close(metrics["train_rollout_kl"], expected)
+    stats = {key: value.item() for key, value in metrics.items() if key.startswith("_policy_stat_")}
+    finalize_policy_stats(stats)
+    normalized_weights = torch.tensor(log_ratios, dtype=torch.float64).softmax(0)
+    expected_ess = 1.0 / (len(log_ratios) * normalized_weights.square().sum())
+    assert stats["ess_ratio"] == pytest.approx(expected_ess.item())
+
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

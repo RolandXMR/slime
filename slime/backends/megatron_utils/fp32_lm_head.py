@@ -7,6 +7,7 @@ The vocabulary GEMM then runs in fp32. Rollout engines still receive a bf16 copy
 
 import json
 import logging
+from contextlib import contextmanager
 
 import torch
 
@@ -49,12 +50,11 @@ def promote_vocab_output_layers(module: torch.nn.Module) -> int:
     return promoted
 
 
-def install_fp32_lm_head_hook() -> None:
+@contextmanager
+def fp32_lm_head_hook():
     """Promote vocabulary heads after ``Float16Module`` casts the model to bf16."""
     from megatron.core.transformer.module import Float16Module
 
-    if getattr(Float16Module, "_slime_fp32_lm_head_installed", False):
-        return
     original_init = Float16Module.__init__
 
     def _init(self, config, module):
@@ -62,7 +62,10 @@ def install_fp32_lm_head_hook() -> None:
         promote_vocab_output_layers(self.module)
 
     Float16Module.__init__ = _init
-    Float16Module._slime_fp32_lm_head_installed = True
+    try:
+        yield
+    finally:
+        Float16Module.__init__ = original_init
 
 
 def cast_lm_head_for_rollout(args, named_tensors):

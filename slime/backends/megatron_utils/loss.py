@@ -743,41 +743,51 @@ def store_value_diagnostics(
     """
     cp_size = mpu.get_context_parallel_world_size()
 
-    columns = {
-        "value_terminal": [],
-        "value_terminal_residual": [],
-        "value_first_residual": [],
-        "value_residual": [],
-        "value_residual_abs": [],
-        "value_residual_std": [],
-    }
+    keys = (
+        "value_terminal",
+        "value_terminal_residual",
+        "value_first_residual",
+        "value_residual",
+        "value_residual_abs",
+        "value_residual_std",
+    )
+    diagnostics = []
     for total_length, response_length, value, ret, loss_mask in zip(
         total_lengths, response_lengths, values, returns, loss_masks, strict=True
     ):
         if cp_size > 1:
-            value = all_gather_with_cp(value, total_length, response_length)
-            ret = all_gather_with_cp(ret, total_length, response_length)
+            full = all_gather_with_cp(torch.stack((value, ret), dim=-1), total_length, response_length)
+            value, ret = full.unbind(-1)
         mask = loss_mask.to(device=value.device, dtype=torch.bool)
         (trainable,) = mask.nonzero(as_tuple=True)
         if trainable.numel() == 0:
             # Keep the columns sample-aligned; a fully-masked sample carries no
             # critic signal.
-            for column in columns.values():
-                column.append(0.0)
+            diagnostics.append(value.new_zeros(len(keys)))
             continue
         residual = (value - ret)[mask]
         first, last = trainable[0], trainable[-1]
-        columns["value_terminal"].append(value[last].item())
-        columns["value_terminal_residual"].append((value[last] - ret[last]).item())
-        columns["value_first_residual"].append((value[first] - ret[first]).item())
-        columns["value_residual"].append(residual.mean().item())
-        columns["value_residual_abs"].append(residual.abs().mean().item())
-        columns["value_residual_std"].append(residual.std(correction=0).item() if residual.numel() > 1 else 0.0)
+        diagnostics.append(
+            torch.stack(
+                (
+                    value[last],
+                    value[last] - ret[last],
+                    value[first] - ret[first],
+                    residual.mean(),
+                    residual.abs().mean(),
+                    residual.std(correction=0),
+                )
+            )
+        )
 
-    rollout_data.update(columns)
+    # Copy the small statistics together instead of synchronizing once per scalar.
+    columns = torch.stack(diagnostics).T.tolist() if diagnostics else [[] for _ in keys]
+    rollout_data.update(zip(keys, columns, strict=True))
 
 
-def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
+def compute_advantages_and_returns(
+    args: Namespace, rollout_data: RolloutBatch, *, store_diagnostics: bool = True
+) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
@@ -801,6 +811,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             "rewards", "values", "response_lengths", "loss_masks",
             "total_lengths"). Modified in-place to add "advantages" and
             "returns" keys, each mapping to lists of tensors per sample.
+        store_diagnostics: Store per-sample value diagnostics when the caller
+            will log or dump them.
     """
     rollout_log_probs: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs")
     log_probs: list[torch.Tensor] | None = (
@@ -881,7 +893,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
-    if values is not None:
+    if values is not None and store_diagnostics:
         store_value_diagnostics(rollout_data, total_lengths, response_lengths, values, returns, loss_masks)
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
@@ -1286,9 +1298,9 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    # ESS is diagnostic-only; saturate extreme ratios before exp/square can overflow.
-    # Named apart from ppo_utils.importance_weights, which score centering calls below.
-    ess_weights = (-ppo_kl.detach().float()).clamp(-20.0, 20.0).exp()
+    # FP64 keeps finite extreme ratios distinct instead of clipping them to the
+    # same weight, which would misleadingly report a high ESS.
+    ess_weights = (-ppo_kl.detach().double()).exp()
 
     if pg_loss_type == "reinforce":
         pg_loss = -advantages.detach() * log_probs
@@ -1407,12 +1419,13 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     train_rollout_kl = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
-        rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        log_probs_to_compare = log_probs if args.use_rollout_logprobs or use_score_centering else old_log_probs
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
-        train_rollout_kl = sum_of_sample_mean(
-            compute_approx_kl(rollout_log_probs, log_probs_to_compare, kl_loss_type="low_var_kl")
-        )
+        with torch.no_grad():
+            rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
+            log_probs_to_compare = log_probs if args.use_rollout_logprobs or use_score_centering else old_log_probs
+            train_rollout_logprob_abs_diff = sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
+            train_rollout_kl = sum_of_sample_mean(
+                compute_approx_kl(rollout_log_probs, log_probs_to_compare, kl_loss_type="low_var_kl")
+            )
 
     sum_of_token = get_sum_of_sample_mean(
         total_lengths,

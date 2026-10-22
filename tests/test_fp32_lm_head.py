@@ -6,15 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 
 from slime.backends.megatron_utils.fp32_lm_head import (
     cast_lm_head_for_rollout,
+    fp32_lm_head_hook,
     promote_vocab_output_layers,
     untie_rollout_embeddings,
-    validate_fp32_lm_head_config,
 )
+
+
+NUM_GPUS = 0
 
 
 class _Head(nn.Module):
@@ -26,7 +30,7 @@ class _Head(nn.Module):
 
     def forward(self, input_, weight=None, runtime_gather_output=None):
         self.seen = input_.dtype
-        return input_
+        return F.linear(input_, self.weight if weight is None else weight), None
 
 
 class _Model(nn.Module):
@@ -45,21 +49,9 @@ def test_promote_casts_vocab_head_and_upcasts_the_gemm_input():
     assert model.output_layer.gradient_accumulation_fusion is False
     assert model.language_model.output_layer.weight.dtype == torch.bfloat16
 
+    assert promote_vocab_output_layers(model) == 1
     model.output_layer(torch.zeros(2, 4, dtype=torch.bfloat16))
     assert model.output_layer.seen == torch.float32
-
-
-def test_promote_is_idempotent():
-    model = _Model()
-    promote_vocab_output_layers(model)
-    promote_vocab_output_layers(model)
-    model.output_layer(torch.zeros(2, 4, dtype=torch.float32))
-    assert model.output_layer.seen == torch.float32
-
-
-class _MatmulHead(_Head):
-    def forward(self, input_, weight=None, runtime_gather_output=None):
-        return F.linear(input_, self.weight if weight is None else weight), None
 
 
 @pytest.mark.parametrize("autocast_enabled", [False, True])
@@ -67,7 +59,7 @@ def test_head_gemm_gradients_and_optimizer_stay_fp32(autocast_enabled):
     torch.manual_seed(123)
     model = nn.Module()
     model.body = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
-    model.output_layer = _MatmulHead(16, torch.bfloat16)
+    model.output_layer = _Head(16, torch.bfloat16)
     promote_vocab_output_layers(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     before = model.output_layer.weight.detach().clone()
@@ -98,47 +90,6 @@ def test_deferred_head_gradients_are_rejected_before_dtype_changes():
     assert model.output_layer.gradient_accumulation_fusion is True
 
 
-def test_deferred_head_gradients_are_rejected_by_argument_validation(monkeypatch):
-    from test_megatron_argument_validation import load_slime_arguments_module, make_slime_validate_args
-
-    args = make_slime_validate_args(fp32_lm_head=True, defer_embedding_wgrad_compute=True)
-    module = load_slime_arguments_module(monkeypatch)
-    with pytest.raises(ValueError, match="does not support --defer-embedding-wgrad-compute"):
-        module.slime_validate_args(args)
-
-
-def test_immediate_head_gradients_allow_fp32():
-    validate_fp32_lm_head_config(SimpleNamespace(defer_embedding_wgrad_compute=False))
-
-
-def test_megatron_prevalidation_rejects_deferred_head_gradients(monkeypatch):
-    from test_megatron_argument_validation import load_arguments_module
-
-    module = load_arguments_module(monkeypatch)
-    with pytest.raises(ValueError, match="does not support --defer-embedding-wgrad-compute"):
-        module.set_default_megatron_args(SimpleNamespace(fp32_lm_head=True, defer_embedding_wgrad_compute=True))
-
-
-@pytest.mark.parametrize("base_flag,override_flag", [(False, True), (True, False)])
-def test_role_overrides_cannot_change_head_tying(base_flag, override_flag, monkeypatch):
-    from test_megatron_argument_validation import load_slime_arguments_module
-
-    module = load_slime_arguments_module(monkeypatch)
-    with pytest.raises(ValueError, match="must be set globally"):
-        module._apply_megatron_role_overrides(
-            SimpleNamespace(fp32_lm_head=base_flag), {"fp32_lm_head": override_flag}, "actor"
-        )
-
-
-@pytest.mark.parametrize("flag", [False, True])
-def test_role_overrides_allow_matching_global_flag(flag, monkeypatch):
-    from test_megatron_argument_validation import load_slime_arguments_module
-
-    module = load_slime_arguments_module(monkeypatch)
-    args = module._apply_megatron_role_overrides(SimpleNamespace(fp32_lm_head=flag), {"fp32_lm_head": flag}, "actor")
-    assert args.fp32_lm_head is flag
-
-
 def test_rollout_copy_of_the_head_is_bf16():
     class Args:
         fp32_lm_head = True
@@ -160,3 +111,99 @@ def test_rollout_server_unties_a_tied_checkpoint():
     assert values["tie_word_embeddings"] is False
     assert values["text_config"]["tie_word_embeddings"] is False
     assert values["dtype"] == "bfloat16"
+
+
+@pytest.fixture
+def native_model(tmp_path):
+    layers = pytest.importorskip("megatron.core.tensor_parallel.layers")
+    module = pytest.importorskip("megatron.core.transformer.module")
+    config_module = pytest.importorskip("megatron.core.transformer.transformer_config")
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("Native CPU smoke requires Gloo")
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+
+    class Model(torch.nn.Module):
+        def __init__(self, *, deferred=False):
+            super().__init__()
+            self.config = config_module.TransformerConfig(
+                num_layers=2,
+                hidden_size=4,
+                num_attention_heads=1,
+                ffn_hidden_size=8,
+                params_dtype=torch.bfloat16,
+                bf16=True,
+                use_cpu_initialization=True,
+                perform_initialization=False,
+                gradient_accumulation_fusion=True,
+                pipeline_model_parallel_size=2 if deferred else 1,
+                pipeline_dtype=torch.bfloat16,
+                defer_embedding_wgrad_compute=deferred,
+            )
+            self.pg_collection = SimpleNamespace(pp=dist.group.WORLD)
+            self.body = torch.nn.Linear(4, 4, bias=False)
+            self.output_layer = layers.ColumnParallelLinear(
+                4,
+                8,
+                config=self.config,
+                init_method=lambda _: None,
+                bias=False,
+                gather_output=False,
+                tp_group=dist.group.WORLD,
+                embedding_activation_buffer=[],
+                grad_output_buffer=[],
+            )
+            with torch.no_grad():
+                self.output_layer.weight.uniform_(-0.1, 0.1)
+
+        def forward(self, x):
+            return self.output_layer(self.body(x))[0]
+
+    try:
+        yield Model, module.Float16Module
+    finally:
+        dist.destroy_process_group()
+
+
+def test_native_head_stays_fp32_under_autocast_backward_and_optimizer(native_model):
+    Model, Float16Module = native_model
+    model = Model()
+    original_init = Float16Module.__init__
+    with fp32_lm_head_hook():
+        wrapped = Float16Module(model.config, model)
+    assert Float16Module.__init__ is original_init
+    ordinary = Model()
+    Float16Module(ordinary.config, ordinary)
+    assert ordinary.output_layer.weight.dtype == torch.bfloat16
+    head_dtypes = []
+    handle = model.output_layer.register_forward_hook(lambda _layer, _inputs, out: head_dtypes.append(out[0].dtype))
+    try:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            logits = wrapped(torch.randn(2, 1, 4))
+    finally:
+        handle.remove()
+    assert head_dtypes == [torch.float32]
+    assert model.body.weight.dtype == torch.bfloat16
+    assert model.output_layer.weight.dtype == torch.float32
+    logits.square().mean().backward()
+    assert model.output_layer.weight.grad.dtype == torch.float32
+    assert model.body.weight.grad.dtype == torch.bfloat16
+    before = model.output_layer.weight.detach().clone()
+    optimizer = torch.optim.AdamW(wrapped.parameters(), lr=0.01)
+    optimizer.step()
+    assert not torch.equal(before, model.output_layer.weight)
+    assert optimizer.state[model.output_layer.weight]["exp_avg"].dtype == torch.float32
+
+    state = model.state_dict()
+    state["output_layer.weight"] = state["output_layer.weight"].bfloat16()
+    model.load_state_dict(state)
+    assert model.output_layer.weight.dtype == torch.float32
+
+
+def test_native_deferred_head_is_rejected_before_backward(native_model):
+    Model, Float16Module = native_model
+    model = Model(deferred=True)
+    original_init = Float16Module.__init__
+    with pytest.raises(ValueError, match="does not support --defer-embedding-wgrad-compute"), fp32_lm_head_hook():
+        Float16Module(model.config, model)
+    assert Float16Module.__init__ is original_init

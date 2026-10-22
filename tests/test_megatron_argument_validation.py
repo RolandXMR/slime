@@ -160,6 +160,115 @@ def load_slime_arguments_module(monkeypatch):
     return module
 
 
+def test_deferred_head_gradients_are_rejected_by_argument_validation(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(fp32_lm_head=True, defer_embedding_wgrad_compute=True)
+    with pytest.raises(ValueError, match="does not support --defer-embedding-wgrad-compute"):
+        module.slime_validate_args(args)
+
+
+def test_megatron_prevalidation_rejects_deferred_head_gradients(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    with pytest.raises(ValueError, match="does not support --defer-embedding-wgrad-compute"):
+        module.set_default_megatron_args(argparse.Namespace(fp32_lm_head=True, defer_embedding_wgrad_compute=True))
+
+
+@pytest.mark.parametrize("base_flag,override_flag", [(False, True), (True, False)])
+def test_role_overrides_cannot_change_head_tying(base_flag, override_flag, monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    with pytest.raises(ValueError, match="must be set globally"):
+        module._apply_megatron_role_overrides(
+            argparse.Namespace(fp32_lm_head=base_flag), {"fp32_lm_head": override_flag}, "actor"
+        )
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_role_overrides_allow_matching_global_flag(flag, monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = module._apply_megatron_role_overrides(
+        argparse.Namespace(fp32_lm_head=flag), {"fp32_lm_head": flag}, "actor"
+    )
+    assert args.fp32_lm_head is flag
+
+
+def test_role_overrides_cannot_retie_fp32_head(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    with pytest.raises(ValueError, match="requires untied embeddings"):
+        module._apply_megatron_role_overrides(
+            argparse.Namespace(fp32_lm_head=True, untie_embeddings_and_output_weights=True),
+            {"untie_embeddings_and_output_weights": False},
+            "actor",
+        )
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_custom_config_fp32_head_is_validated_after_overrides(monkeypatch, tmp_path, deferred):
+    module = load_slime_arguments_module(monkeypatch)
+    config = tmp_path / "custom.yaml"
+    config.write_text(f"fp32_lm_head: true\ndefer_embedding_wgrad_compute: {str(deferred).lower()}\n")
+    args = make_slime_validate_args(
+        custom_config_path=str(config), fp32_lm_head=False, untie_embeddings_and_output_weights=False
+    )
+    if deferred:
+        with pytest.raises(ValueError, match="does not support --defer-embedding-wgrad-compute"):
+            module.slime_validate_args(args)
+    else:
+        args, _ = module.slime_validate_args(args)
+        assert args.fp32_lm_head and args.untie_embeddings_and_output_weights
+
+
+@pytest.mark.parametrize("role", ["actor", "critic"])
+@pytest.mark.parametrize("resuming", [False, True])
+@pytest.mark.parametrize("explicit_finetune", [False, True])
+def test_role_checkpoint_override_applies_fallback(monkeypatch, tmp_path, role, resuming, explicit_finetune):
+    module = load_slime_arguments_module(monkeypatch)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    if resuming:
+        (checkpoint / "latest_checkpointed_iteration.txt").write_text("7")
+    config = tmp_path / "roles.yaml"
+    config.write_text(f"megatron:\n  - role: {role}\n    overrides:\n      load: {checkpoint}\n")
+    base = make_slime_validate_args(
+        ref_load="reference", ref_ckpt_step=3, start_rollout_id=8, finetune=explicit_finetune
+    )
+    module._apply_load_fallback(base)
+    args = module.parse_megatron_role_args(base, config, role)
+    assert args.load == (str(checkpoint) if resuming else "reference")
+    assert args.no_load_optim == args.no_load_rng == (not resuming)
+    assert args.finetune == (explicit_finetune or not resuming)
+    assert args.ckpt_step == (None if resuming else 3)
+    assert args.start_rollout_id == 8
+    assert base.load == "reference" and base.finetune
+
+
+def test_role_checkpoint_resume_preserves_explicit_custom_load_options(monkeypatch, tmp_path):
+    module = load_slime_arguments_module(monkeypatch)
+    custom = tmp_path / "custom.yaml"
+    custom.write_text("no_load_optim: true\nno_load_rng: true\nfinetune: true\nckpt_step: 11\nstart_rollout_id: 17\n")
+    base, _ = module.slime_validate_args(make_slime_validate_args(custom_config_path=str(custom)))
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "latest_checkpointed_iteration.txt").write_text("11")
+    roles = tmp_path / "roles.yaml"
+    roles.write_text(f"megatron:\n  - role: critic\n    overrides:\n      load: {checkpoint}\n")
+    args = module.parse_megatron_role_args(base, roles, "critic")
+    assert args.load == str(checkpoint)
+    assert args.no_load_optim and args.no_load_rng and args.finetune
+    assert args.ckpt_step == 11 and args.start_rollout_id == 17
+
+
+@pytest.mark.parametrize("custom_evaluator", [False, True])
+def test_eval_interval_requires_datasets_or_custom_evaluator(monkeypatch, custom_evaluator):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(eval_interval=1, eval_function_path="custom.eval" if custom_evaluator else None)
+    if custom_evaluator:
+        args, _ = module.slime_validate_args(args)
+        assert args.eval_function_path == "custom.eval" and not args.eval_datasets
+    else:
+        with pytest.raises(AssertionError, match="datasets or a custom eval function"):
+            module.slime_validate_args(args)
+
+
 @pytest.mark.parametrize("strategy", [None, "mcore", "nvrx"])
 def test_native_async_checkpoint_default_preserves_explicit_strategy(monkeypatch, strategy):
     module = load_slime_arguments_module(monkeypatch)

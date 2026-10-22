@@ -41,10 +41,6 @@ import socket
 import sys
 import types
 
-_fake_wandb = types.ModuleType("wandb")
-_fake_wandb.run = None
-sys.modules.setdefault("wandb", _fake_wandb)
-
 # --- Stub ``megatron.core.mpu`` (must run before cp_utils is imported) ---
 #
 # Both this module and any test file that imports it should *import this

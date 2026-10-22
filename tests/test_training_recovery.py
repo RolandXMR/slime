@@ -91,6 +91,7 @@ def test_configuration_allows_trainer_parallelism_and_memory_changes(args):
     serving.configuration = retained_rollout_configuration(args)
     serving.driver_job_id = None
     updated = copy.copy(args)
+    updated._load_fallback_options = {"finetune": False, "ckpt_step": None}
     updated.tensor_model_parallel_size = 4
     updated.tensor_parallel_num_weight_shards = 4
     updated.gtp_weight_remat_size = 1

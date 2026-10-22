@@ -58,9 +58,8 @@ def reduce_train_step_metrics(
         num_samples_or_tokens = step_global_batch_size
         cp_factor = 1
     metrics = {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
-    sum_scale = num_samples_or_tokens / cp_factor
-    finalize_value_head_stats(metrics, sum_scale)
-    finalize_policy_stats(metrics, sum_scale)
+    finalize_value_head_stats(metrics)
+    finalize_policy_stats(metrics)
     return metrics
 
 
@@ -74,14 +73,13 @@ _VALUE_STAT_KEYS = (
 )
 
 
-def finalize_value_head_stats(metrics: dict[str, float], sum_scale: float) -> None:
+def finalize_value_head_stats(metrics: dict[str, float]) -> None:
     """Fold global value-loss sufficient statistics into critic-health metrics."""
     if not all(key in metrics for key in _VALUE_STAT_KEYS):
         return
-    count, ret_sum, ret_sq_sum, res_sum, res_sq_sum, value_sq_sum = (
-        metrics.pop(key) * sum_scale for key in _VALUE_STAT_KEYS
-    )
-    if count < 2:
+    # These ratios are unchanged by the reporting normalizer applied to every sum.
+    count, ret_sum, ret_sq_sum, res_sum, res_sq_sum, value_sq_sum = (metrics.pop(key) for key in _VALUE_STAT_KEYS)
+    if count <= 0:
         return
     ret_mean = ret_sum / count
     res_mean = res_sum / count
@@ -102,18 +100,14 @@ _POLICY_STAT_KEYS = (
 )
 
 
-def finalize_policy_stats(metrics: dict[str, float], sum_scale: float) -> None:
+def finalize_policy_stats(metrics: dict[str, float]) -> None:
     """Fold global importance-weight sums into the normalized ESS ratio."""
     if not all(key in metrics for key in _POLICY_STAT_KEYS):
         return
-    count, weight_sum, weight_sq_sum = (
-        metrics.pop(key) * sum_scale for key in _POLICY_STAT_KEYS
-    )
+    count, weight_sum, weight_sq_sum = (metrics.pop(key) for key in _POLICY_STAT_KEYS)
     finite = all(math.isfinite(value) for value in (count, weight_sum, weight_sq_sum))
     metrics["ess_ratio"] = (
-        weight_sum**2 / (count * weight_sq_sum)
-        if finite and count > 0 and weight_sq_sum > 0
-        else 0.0
+        weight_sum**2 / (count * weight_sq_sum) if finite and count > 0 and weight_sq_sum > 0 else 0.0
     )
 
 

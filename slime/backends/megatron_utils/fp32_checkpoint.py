@@ -32,6 +32,8 @@ def _prepare_fp32_head_load(state_dict, metadata, checkpoint_args, *, optimizer_
         raise ValueError(
             "Cannot restore optimizer state while --fp32-lm-head changes tied embeddings or the head dtype. Use --no-load-optim or --finetune to initialize a fresh optimizer; checkpoints saved with a separate FP32 head can resume normally."
         )
+    if not tied:
+        return state_dict
 
     def retarget(value):
         if isinstance(value, dict):
@@ -40,7 +42,7 @@ def _prepare_fp32_head_load(state_dict, metadata, checkpoint_args, *, optimizer_
             return [retarget(item) for item in value]
         if not isinstance(value, ShardedTensor):
             return value
-        if tied and value.key.endswith("embedding.word_embeddings.weight") and value.key in metadata:
+        if value.key.endswith("embedding.word_embeddings.weight") and value.key in metadata:
             source_dtype = metadata[value.key].dtype
             if value.dtype != source_dtype:
                 # All replicas of an aliased key must request the same dtype.
@@ -50,7 +52,7 @@ def _prepare_fp32_head_load(state_dict, metadata, checkpoint_args, *, optimizer_
                 return dataclasses.replace(value, dtype=source_dtype, data=data)
         if not _is_vocab_head(value.key, value):
             return value
-        if value.key in metadata or not tied:
+        if value.key in metadata:
             return value
         source_key = value.key.removesuffix("output_layer.weight") + "embedding.word_embeddings.weight"
         if source_key not in metadata:

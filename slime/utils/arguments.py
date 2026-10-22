@@ -1795,10 +1795,8 @@ def parse_args(add_custom_arguments=None, *, return_restore_plan=False):
 def _apply_load_fallback(args):
     """If args.load is not a usable checkpoint, fall back to ref_load (fresh start).
 
-    Called on the base args at CLI-parse time, and re-run for the critic in
-    parse_megatron_role_args: a yaml `load:` override pointing at the critic's
-    own save dir cannot exist on a first run and would otherwise overwrite the
-    fallback that already ran on the base args, tripping the load assert.
+    Run on base args and after role-specific load overrides. Keep the original
+    load options so a valid role checkpoint can resume after a base fallback.
     """
     load_is_megatron = (
         args.load is not None
@@ -1813,6 +1811,11 @@ def _apply_load_fallback(args):
 
         load_is_hf = supports_hf_weight_loading(args.load)
     if not load_is_megatron:
+        if not hasattr(args, "_load_fallback_options"):
+            args._load_fallback_options = {
+                key: getattr(args, key)
+                for key in ("no_load_optim", "no_load_rng", "finetune", "ckpt_step", "start_rollout_id")
+            }
         args.no_load_optim = True
         args.no_load_rng = True
         args.finetune = True
@@ -1829,6 +1832,9 @@ def _apply_load_fallback(args):
 def _apply_megatron_role_overrides(base_args, overrides, role):
     role_args = copy.deepcopy(base_args)
     ignored_keys = {"num_nodes", "num_gpus_per_node"}
+    if "load" in overrides:
+        for key, value in vars(role_args).pop("_load_fallback_options", {}).items():
+            setattr(role_args, key, value)
 
     # Apply overrides from the YAML config.
     # Unspecified keys inherit from base_args via deepcopy.
@@ -1838,6 +1844,8 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
                 "fp32_lm_head must be set globally with --fp32-lm-head, not changed in per-role overrides; "
                 "the actor and rollout engines must agree on whether embeddings are tied."
             )
+        if key == "untie_embeddings_and_output_weights" and not value and getattr(base_args, "fp32_lm_head", False):
+            raise ValueError("--fp32-lm-head requires untied embeddings; per-role overrides cannot tie them again.")
         if key in ignored_keys:
             logger.info(f"Ignoring {role} config key '{key}'; GPU allocation always follows CLI args.")
             continue
@@ -1902,10 +1910,8 @@ def parse_megatron_role_args(base_args, megatron_config_path, role):
         )
 
     role_args = _apply_megatron_role_overrides(base_args, overrides, role)
-    if role == "critic" and "load" in overrides:
-        # The base args' load fallback ran before this override was applied;
-        # re-run it so a critic load dir that does not exist yet (fresh run)
-        # falls back to ref_load (value head is reinitialized on load).
+    if "load" in overrides:
+        # Role overrides are applied after the base checkpoint fallback.
         _apply_load_fallback(role_args)
     logger.info(
         f"Parsed megatron config for role={role} from {megatron_config_path}: overrides = {list(overrides.keys())}"
@@ -1962,14 +1968,6 @@ def slime_validate_args(args):
     from slime.utils.score_centering import validate_score_centering_args
 
     args = copy.deepcopy(args)
-    if getattr(args, "fp32_lm_head", False):
-        from slime.backends.megatron_utils.fp32_lm_head import validate_fp32_lm_head_config
-
-        validate_fp32_lm_head_config(args)
-        # Applied again in megatron_parse_args before HF validation. Repeated here so
-        # callers that build the model from an already-parsed namespace still untie.
-        args.untie_embeddings_and_output_weights = True
-
     if getattr(args, "rollout_cleanup_timeout", 60) <= 0:
         raise ValueError("--rollout-cleanup-timeout must be positive")
     get_pg_loss_type(args)
@@ -2255,6 +2253,14 @@ def slime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+            if k in getattr(args, "_load_fallback_options", {}):
+                args._load_fallback_options[k] = v
+
+    if getattr(args, "fp32_lm_head", False):
+        from slime.backends.megatron_utils.fp32_lm_head import validate_fp32_lm_head_config
+
+        validate_fp32_lm_head_config(args)
+        args.untie_embeddings_and_output_weights = True
 
     if args.eval_max_context_len is None:
         logger.info(

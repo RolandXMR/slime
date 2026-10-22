@@ -16,7 +16,7 @@ from tqdm import tqdm
 from transformers import AutoConfig
 from typing_extensions import override
 
-from slime.backends.megatron_utils.hf_checkpoint_saver import _untie_hf_config
+from slime.backends.megatron_utils.hf_checkpoint_saver import _copy_hf_assets
 from slime.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
 
 
@@ -341,21 +341,6 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
             print(f"{filename} saved in {elapsed:.2f} sec.")
 
 
-def copy_assets(origin_hf_dir, output_dir, *, untie_embeddings=False):
-    for filename in os.listdir(origin_hf_dir):
-        if filename == "model.safetensors.index.json" or filename.endswith(".safetensors"):
-            continue
-        origin_filename = os.path.join(origin_hf_dir, filename)
-        if not os.path.isfile(origin_filename):
-            print(f"Skip {filename}, not a file.")
-            continue
-        src, dst = origin_filename, os.path.join(output_dir, filename)
-        print(f"copy from {src} to {dst}")
-        shutil.copy(src, dst)
-    if untie_embeddings:
-        _untie_hf_config(output_dir)
-
-
 def conversion_worker(
     worker_id,
     keys,
@@ -578,7 +563,7 @@ if __name__ == "__main__":
     print("Model converted and saved.")
 
     if args.origin_hf_dir:
-        copy_assets(
+        _copy_hf_assets(
             args.origin_hf_dir,
             args.output_dir,
             untie_embeddings=getattr(megatron_args, "fp32_lm_head", False),

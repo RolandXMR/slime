@@ -148,7 +148,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             # no Adam moments to load, and Megatron must skip its optimizer keys.
             args.no_load_optim = True
         checkpoint_load_context = nullcontext()
-        if getattr(args, "fp32_lm_head", False):
+        if getattr(args, "fp32_lm_head", False) and getattr(ddp_model[0], "role", "actor") == "actor":
             from .fp32_checkpoint import fp32_head_checkpoint_loading
 
             checkpoint_load_context = fp32_head_checkpoint_loading(

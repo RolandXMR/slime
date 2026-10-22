@@ -97,13 +97,6 @@ def validate_args(args):
         )
 
 
-def _embeddings_match(args, hf_tied, megatron_untied):
-    """Tied HF weights match a tied Megatron model, unless the fp32 head unties it."""
-    if getattr(args, "fp32_lm_head", False):
-        return True
-    return hf_tied != megatron_untied
-
-
 def _hf_validate_args(args, hf_config):
     def equal(x, y):
         return x == y
@@ -136,7 +129,11 @@ def _hf_validate_args(args, hf_config):
         ("intermediate_size", "ffn_hidden_size", equal),
         ("moe_intermediate_size", "moe_ffn_hidden_size", equal),
         ("shared_expert_intermediate_size", "moe_shared_expert_intermediate_size", equal),
-        ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: _embeddings_match(args, x, y)),
+        (
+            "tie_word_embeddings",
+            "untie_embeddings_and_output_weights",
+            lambda x, y: getattr(args, "fp32_lm_head", False) or x != y,
+        ),
         ("rms_norm_eps", "norm_epsilon", equal),
         ("rms_norm_eps", "layernorm_epsilon", equal),
     ]:

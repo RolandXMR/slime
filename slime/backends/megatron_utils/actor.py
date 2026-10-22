@@ -430,12 +430,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # Compute current critic values (used as old_values for value loss and for actor advantages).
         rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
 
-        compute_advantages_and_returns(self.args, rollout_data)
+        critic_only = rollout_id < self.args.num_critic_only_steps
+        compute_advantages_and_returns(self.args, rollout_data, store_diagnostics=critic_only)
 
         # Warmup steps skip train_actor entirely, so the actor-side rollout
         # logging and train debug dump would leave them blind; surface both from
         # the critic on exactly those steps (no overlap with the actor's).
-        if rollout_id < self.args.num_critic_only_steps:
+        if critic_only:
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
             train_metric_utils.log_rollout_data(rollout_id, self.args, rollout_data)
