@@ -147,13 +147,25 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             # The master parameters are rebuilt from the saved model. There are
             # no Adam moments to load, and Megatron must skip its optimizer keys.
             args.no_load_optim = True
-        result = _load_checkpoint_megatron(
-            ddp_model=ddp_model,
-            optimizer=optimizer,
-            opt_param_scheduler=opt_param_scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=False,
-        )
+        checkpoint_load_context = nullcontext()
+        if getattr(args, "fp32_lm_head", False):
+            from .fp32_checkpoint import fp32_head_checkpoint_loading
+
+            checkpoint_load_context = fp32_head_checkpoint_loading(
+                optimizer_requested=(
+                    optimizer is not None
+                    and not getattr(args, "no_load_optim", False)
+                    and not getattr(args, "finetune", False)
+                )
+            )
+        with checkpoint_load_context:
+            result = _load_checkpoint_megatron(
+                ddp_model=ddp_model,
+                optimizer=optimizer,
+                opt_param_scheduler=opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=False,
+            )
         if getattr(args, "ckpt_step", None) is not None and not args.finetune and result[0] != args.ckpt_step:
             raise ValueError(
                 f"Model loaded step {result[0]}, but checkpoint restoration requires step {args.ckpt_step}. "

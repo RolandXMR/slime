@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
+from copy import deepcopy
 from urllib.parse import urlparse
 
 import requests
@@ -81,6 +83,51 @@ def get_server_info(url: str, timeout: float = 30.0) -> dict:
         except Exception as exc:
             errors.append(f"{endpoint}: {exc}")
     raise RuntimeError(f"Failed to fetch SGLang server info from {url}: {'; '.join(errors)}")
+
+
+def validate_external_fp32_lm_head(server_info: dict, *, worker_type: str = "regular") -> None:
+    """Require external serving to own a head independently of its embeddings."""
+    if worker_type == "encoder" or server_info.get("encoder_only"):
+        return
+
+    guidance = (
+        "Relaunch the external SGLang server with untied embeddings, using "
+        "--json-model-override-args '{\"tie_word_embeddings\":false,"
+        "\"text_config\":{\"tie_word_embeddings\":false}}' for a model with text_config "
+        "(omit text_config for a plain text model)."
+    )
+    try:
+        from sglang.srt.utils.hf_transformers_utils import get_config, get_hf_text_config
+
+        model_path = server_info.get("model_path")
+        if not isinstance(model_path, str) or not model_path:
+            raise ValueError("the server did not report model_path")
+        overrides = json.loads(server_info.get("json_model_override_args") or "{}")
+        if not isinstance(overrides, dict):
+            raise ValueError("json_model_override_args must be a JSON object")
+        config = get_config(
+            model_path,
+            trust_remote_code=bool(server_info.get("trust_remote_code", False)),
+            revision=server_info.get("revision"),
+            model_override_args=overrides,
+            model_config_parser=server_info.get("model_config_parser") or "auto",
+        )
+        # SGLang resolves a VLM's effective language config through this helper.
+        # It can normalize nested configs, so preserve get_config's cached value.
+        text_config = get_hf_text_config(deepcopy(config))
+        tied = getattr(text_config, "tie_word_embeddings", None)
+        if tied is None:
+            raise ValueError("the model configuration does not report tie_word_embeddings")
+    except Exception as exc:
+        raise ValueError(
+            "Cannot verify that the external SGLang server has an independent LM head required by "
+            f"--fp32-lm-head: {exc}. Ensure its reported model configuration is accessible. {guidance}"
+        ) from exc
+    if tied is not False:
+        raise ValueError(
+            "--fp32-lm-head cannot update an external SGLang server with tied embeddings: "
+            f"the trained LM head would overwrite its token embeddings. {guidance}"
+        )
 
 
 def _infer_worker_type(server_info: dict) -> str:

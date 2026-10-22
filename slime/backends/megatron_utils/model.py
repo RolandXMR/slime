@@ -306,8 +306,9 @@ def setup_model_and_optimizer(
     assert args.load is not None or args.pretrained_checkpoint is not None
 
     if role == "actor" and getattr(args, "fp32_lm_head", False):
-        from .fp32_lm_head import install_fp32_lm_head_hook
+        from .fp32_lm_head import install_fp32_lm_head_hook, validate_fp32_lm_head_config
 
+        validate_fp32_lm_head_config(args)
         # The hook runs inside Float16Module, after the bf16 cast and before DDP
         # records parameter dtypes.
         install_fp32_lm_head_hook()

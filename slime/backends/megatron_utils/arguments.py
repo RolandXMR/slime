@@ -163,6 +163,10 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
+    if getattr(args, "fp32_lm_head", False):
+        from slime.backends.megatron_utils.fp32_lm_head import validate_fp32_lm_head_config
+
+        validate_fp32_lm_head_config(args)
     # Megatron 0.19 validates MTP before resolving this legacy RoPE flag.
     # Normalize it here for both training and checkpoint conversion.
     if getattr(args, "use_rotary_position_embeddings", False):

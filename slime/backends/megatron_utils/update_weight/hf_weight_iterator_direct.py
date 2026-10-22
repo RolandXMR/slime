@@ -17,12 +17,13 @@ from .common import all_gather_params_async, named_params_and_buffers
 
 
 class HfWeightIteratorDirect:
-    def __init__(self, args, model, model_name, quantization_config, transform_ue8m0=True):
+    def __init__(self, args, model, model_name, quantization_config, transform_ue8m0=True, *, for_rollout=True):
         self.args = args
         self.model = model
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.transform_ue8m0 = transform_ue8m0
+        self.for_rollout = for_rollout
         self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(self.args, self.model)
 
     def get_hf_weight_chunks(
@@ -65,6 +66,7 @@ class HfWeightIteratorDirect:
                     param,
                     self.quantization_config,
                     transform_ue8m0=self.transform_ue8m0,
+                    for_rollout=self.for_rollout,
                 )
             )
         return hf_named_tensors

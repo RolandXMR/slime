@@ -13,6 +13,15 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def validate_fp32_lm_head_config(config) -> None:
+    """Native deferred wgrad cannot use this head's non-fused backward path."""
+    if getattr(config, "defer_embedding_wgrad_compute", False):
+        raise ValueError(
+            "--fp32-lm-head does not support --defer-embedding-wgrad-compute; "
+            "remove --defer-embedding-wgrad-compute so the FP32 head computes its gradients immediately."
+        )
+
+
 def promote_vocab_output_layers(module: torch.nn.Module) -> int:
     """Cast untied vocabulary heads to fp32 and make their GEMM match that dtype.
 
@@ -26,11 +35,12 @@ def promote_vocab_output_layers(module: torch.nn.Module) -> int:
         weight = getattr(layer, "weight", None)
         if not isinstance(weight, torch.Tensor) or weight.ndim != 2 or weight.shape[0] <= 1:
             continue
+        validate_fp32_lm_head_config(getattr(layer, "config", None))
         if weight.dtype != torch.float32:
             weight.data = weight.data.float()
         if hasattr(layer, "gradient_accumulation_fusion"):
-            # The fused accumulator kernel expects bf16/fp16 activations. This GEMM
-            # is fp32 on both sides, so the plain matmul backward is the one that applies.
+            # Use the plain FP32 matmul backward for the vocabulary head. Native
+            # deferred wgrad requires fusion and is rejected above.
             layer.gradient_accumulation_fusion = False
         _wrap_fp32_forward(layer)
         promoted += 1
@@ -89,11 +99,15 @@ def _wrap_fp32_forward(layer: torch.nn.Module) -> None:
     original = layer.forward
 
     def forward(input_, weight=None, runtime_gather_output=None):
-        if torch.is_tensor(input_) and input_.is_floating_point() and input_.dtype != torch.float32:
-            input_ = input_.float()
-        if weight is not None and weight.is_floating_point() and weight.dtype != torch.float32:
-            weight = weight.float()
-        return original(input_, weight, runtime_gather_output)
+        # Casting operands alone is insufficient: an enclosing AMP context can
+        # cast the GEMM straight back to bf16. Preserve FP32 computation as well
+        # as FP32 parameter storage.
+        with torch.autocast(device_type=input_.device.type, enabled=False):
+            if input_.is_floating_point() and input_.dtype != torch.float32:
+                input_ = input_.float()
+            if weight is not None and weight.is_floating_point() and weight.dtype != torch.float32:
+                weight = weight.float()
+            return original(input_, weight, runtime_gather_output)
 
     layer.forward = forward
     layer._slime_fp32_lm_head = True

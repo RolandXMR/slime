@@ -14,7 +14,10 @@ from .qwen3moe import convert_qwen3moe_to_hf
 
 
 # TODO optimize code details
-def convert_to_hf(args, model_name, name, param, quantization_config=None, transform_ue8m0=True):
+def convert_to_hf(
+    args, model_name, name, param, quantization_config=None, transform_ue8m0=True, *, for_rollout=True
+):
+    """Map weights to HF names, preserving training precision for checkpoint exports."""
     # MCore 0.19 renamed the live MTP module; its checkpoint keys still use
     # transformer_layer. Keep model-specific mapping and quantization consistent.
     name = name.replace(".mtp_model_layer.", ".transformer_layer.")
@@ -26,9 +29,10 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, trans
 
     param = remove_padding(name, param, args.vocab_size)
     converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)
-    from ..fp32_lm_head import cast_lm_head_for_rollout
+    if for_rollout:
+        from ..fp32_lm_head import cast_lm_head_for_rollout
 
-    converted_named_tensors = cast_lm_head_for_rollout(args, converted_named_tensors)
+        converted_named_tensors = cast_lm_head_for_rollout(args, converted_named_tensors)
 
     return quantize_params(args, name, converted_named_tensors, quantization_config, transform_ue8m0)
 

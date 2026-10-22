@@ -81,6 +81,7 @@ class UpdateWeightFromDisk:
             model_name=self.model_name,
             quantization_config=self.quantization_config,
             progress_desc="Save HF  weights for update from disk",
+            for_rollout=True,
         )
         dist.barrier(group=get_gloo_group())
 

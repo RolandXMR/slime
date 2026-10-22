@@ -120,7 +120,11 @@ class UpdateWeightFromDiskDelta(UpdateWeightFromDistributed):
         """Publish restored weights and seed deltas from those exact HF tensors."""
         path = Path(self._version_dir)
         if dist.get_rank() == 0:
-            _copy_hf_assets(self.args.hf_checkpoint, path)
+            _copy_hf_assets(
+                self.args.hf_checkpoint,
+                path,
+                untie_embeddings=getattr(self.args, "fp32_lm_head", False),
+            )
         self._snapshot.clear()
         writer = _SafetensorShardWriter(path, enabled=self._is_pp_src_rank)
         chunk_index = dist.get_rank()

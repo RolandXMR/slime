@@ -212,6 +212,10 @@ class SGLangEngine(RayActor):
 
         actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
         _sanity_check_server_args(actual_server_args, expect_server_args)
+        if getattr(self.args, "fp32_lm_head", False):
+            from slime.backends.sglang_utils.external import validate_external_fp32_lm_head
+
+            validate_external_fp32_lm_head(actual_server_args, worker_type=self.worker_type)
         self._register_to_router(expect_server_args)
 
     def _init_normal(self, server_args_dict):

@@ -29,8 +29,9 @@ def save_hf_model_to_path(
     model_name: str | None = None,
     quantization_config: dict[str, Any] | None = None,
     progress_desc: str = "Save HF checkpoint",
+    for_rollout: bool = False,
 ) -> None:
-    """Save a Megatron model as an HF safetensors checkpoint."""
+    """Save model precision, or a BF16 vocabulary head for a rollout disk update."""
     path = Path(output_dir)
     hf_checkpoint = Path(args.hf_checkpoint).resolve()
     save_path = path.resolve()
@@ -56,7 +57,11 @@ def save_hf_model_to_path(
             logger.info("Saving model in HuggingFace format to %s", path)
             path.mkdir(parents=True, exist_ok=True)
             _clear_existing_hf_weights(path)
-            _copy_hf_assets(args.hf_checkpoint, path)
+            _copy_hf_assets(
+                args.hf_checkpoint,
+                path,
+                untie_embeddings=getattr(args, "fp32_lm_head", False),
+            )
         except Exception as e:
             setup_error = repr(e)
 
@@ -90,6 +95,7 @@ def save_hf_model_to_path(
         model_name=model_name,
         quantization_config=quantization_config,
         transform_ue8m0=False,
+        for_rollout=for_rollout,
     )
     megatron_local_weights = dict(named_params_and_buffers(args, model))
     num_save_nodes, save_node_rank, is_writer_rank, writer_ranks = _get_node_save_layout(args)
@@ -317,7 +323,7 @@ def _clear_existing_hf_weights(path: Path) -> None:
             item.unlink()
 
 
-def _copy_hf_assets(origin_hf_dir: str, output_dir: Path) -> None:
+def _copy_hf_assets(origin_hf_dir: str, output_dir: Path, *, untie_embeddings: bool = False) -> None:
     origin = Path(origin_hf_dir)
     if not origin.is_dir():
         raise ValueError(f"--hf-checkpoint must be a local directory when using raw --save-hf: {origin_hf_dir}")
@@ -327,6 +333,20 @@ def _copy_hf_assets(origin_hf_dir: str, output_dir: Path) -> None:
             if _is_hf_weight_file(item):
                 continue
             shutil.copy2(item, output_dir / item.name)
+
+    if untie_embeddings:
+        _untie_hf_config(output_dir)
+
+
+def _untie_hf_config(output_dir: str | Path) -> None:
+    """Persist the separate head created from a tied pretrained checkpoint."""
+    config_path = Path(output_dir) / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["tie_word_embeddings"] = False
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        text_config["tie_word_embeddings"] = False
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
 def _is_hf_weight_file(path: Path) -> bool:

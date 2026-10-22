@@ -145,5 +145,47 @@ def test_restart_publishes_restored_weights_above_every_attempt(tmp_path, delta_
     assert (source / "weight_v000008/config.json").read_text() == (base / "config.json").read_text()
 
 
+def test_full_sync_preserves_an_untied_rollout_head(tmp_path, delta_module):
+    base = tmp_path / "base"
+    base.mkdir()
+    config = {"tie_word_embeddings": True, "text_config": {"tie_word_embeddings": True}}
+    original_config = json.dumps(config)
+    (base / "config.json").write_text(original_config, encoding="utf-8")
+    versions = tmp_path / "versions"
+    args = SimpleNamespace(
+        hf_checkpoint=str(base),
+        fp32_lm_head=True,
+        update_weight_disk_dir=str(versions),
+        update_weight_delta_encoding="xor",
+        update_weight_delta_checksum="adler32",
+        custom_update_weight_post_write_path=None,
+    )
+    current = {
+        "model.language_model.embed_tokens.weight": torch.full((4, 3), 2.0, dtype=torch.bfloat16),
+        "lm_head.weight": torch.full((4, 3), 1.0, dtype=torch.bfloat16),
+    }
+    updater = delta_module.UpdateWeightFromDiskDelta(
+        args, [], lambda: current, model_name="qwen3_5", quantization_config=None
+    )
+    updater.connect_rollout_engines(["engine"], None)
+    updater._iter_non_expert_chunks = lambda: iter([list(current.items())])
+    updater._iter_expert_chunks = lambda: iter([])
+    updater._reload_engines = lambda: None
+    updater._record_metrics = lambda: None
+
+    updater.update_weights()
+
+    published = versions / "weight_v000001"
+    config = json.loads((published / "config.json").read_text(encoding="utf-8"))
+    assert config["tie_word_embeddings"] is False
+    assert config["text_config"]["tie_word_embeddings"] is False
+    assert (base / "config.json").read_text(encoding="utf-8") == original_config
+    index = json.loads((published / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    for name, expected in current.items():
+        actual = safetensors.torch.load_file(published / index["weight_map"][name])[name]
+        assert actual.dtype == torch.bfloat16
+        assert torch.equal(actual, expected)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

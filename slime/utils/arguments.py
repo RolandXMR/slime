@@ -258,7 +258,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Keep the actor vocabulary head in fp32 and run its GEMM in fp32. "
                     "The rest of the model stays at the bf16 training dtype. Tied checkpoints "
                     "get a separate head initialized from the token embedding, which stays bf16. "
-                    "Rollout engines receive a bf16 copy of the head."
+                    "Rollout engines receive a bf16 copy of the head. "
+                    "Incompatible with --defer-embedding-wgrad-compute."
                 ),
             )
             parser.add_argument(
@@ -1832,6 +1833,11 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
     # Apply overrides from the YAML config.
     # Unspecified keys inherit from base_args via deepcopy.
     for key, value in overrides.items():
+        if key == "fp32_lm_head" and value != getattr(base_args, "fp32_lm_head", False):
+            raise ValueError(
+                "fp32_lm_head must be set globally with --fp32-lm-head, not changed in per-role overrides; "
+                "the actor and rollout engines must agree on whether embeddings are tied."
+            )
         if key in ignored_keys:
             logger.info(f"Ignoring {role} config key '{key}'; GPU allocation always follows CLI args.")
             continue
@@ -1957,6 +1963,9 @@ def slime_validate_args(args):
 
     args = copy.deepcopy(args)
     if getattr(args, "fp32_lm_head", False):
+        from slime.backends.megatron_utils.fp32_lm_head import validate_fp32_lm_head_config
+
+        validate_fp32_lm_head_config(args)
         # Applied again in megatron_parse_args before HF validation. Repeated here so
         # callers that build the model from an already-parsed namespace still untie.
         args.untie_embeddings_and_output_weights = True

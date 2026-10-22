@@ -13,6 +13,7 @@ import torch.distributed.checkpoint as dist_cp
 from transformers import AutoConfig
 from typing_extensions import override
 
+from slime.backends.megatron_utils.hf_checkpoint_saver import _untie_hf_config
 from slime.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
 
 
@@ -114,7 +115,7 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
     for name, param in get_named_params(args, state_dict):
         if vocab_size:
             param = remove_padding(name, param, vocab_size)
-        converted_named_tensors = convert_to_hf(args, model_name, name, param)
+        converted_named_tensors = convert_to_hf(args, model_name, name, param, for_rollout=False)
         for converted_name, converted_param in converted_named_tensors:
             converted_names.add(converted_name)
             tensor_size = converted_param.numel() * converted_param.element_size()
@@ -162,7 +163,7 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
         print(f"{filename} saved in {time.time() - t:.2f} sec.")
 
 
-def copy_assets(origin_hf_dir, output_dir):
+def copy_assets(origin_hf_dir, output_dir, *, untie_embeddings=False):
     for filename in os.listdir(origin_hf_dir):
         if filename == "model.safetensors.index.json" or filename.endswith(".safetensors"):
             continue
@@ -173,6 +174,8 @@ def copy_assets(origin_hf_dir, output_dir):
         src, dst = origin_filename, os.path.join(output_dir, filename)
         print(f"copy from {src} to {dst}")
         shutil.copy(src, dst)
+    if untie_embeddings:
+        _untie_hf_config(output_dir)
 
 
 if __name__ == "__main__":
@@ -241,4 +244,8 @@ if __name__ == "__main__":
     )
 
     if args.origin_hf_dir:
-        copy_assets(args.origin_hf_dir, args.output_dir)
+        copy_assets(
+            args.origin_hf_dir,
+            args.output_dir,
+            untie_embeddings=getattr(megatron_args, "fp32_lm_head", False),
+        )
