@@ -77,11 +77,13 @@ def test_truncation_fraction_is_reported_once_for_all_rollout_sources(monkeypatc
         "loss_masks": [[1], [1]],
         "global_batch_sizes": [2],
         "truncated": [0, 1],
+        "metadata": [{"malformed_tool_call_spans": []}, {"malformed_tool_call_spans": [(0, 1)]}],
     }
     train_metric_utils.log_rollout_data(0, args, data)
     assert captured["truncated"] == (1, 2)
     assert "truncated_ratio" not in captured
     assert captured["response_lengths"] == (2, 2)
+    assert "metadata" not in captured
     assert data["truncated"] == [0, 1]  # Training still receives the internal flags.
 
 

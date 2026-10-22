@@ -228,6 +228,7 @@ def log_rollout_data(
             "num_microbatches",
             "micro_batch_indices",
             "source_names",
+            "metadata",
             "local_raw_reward",
         }
         per_rollout_mean_keys = {
