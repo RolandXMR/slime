@@ -482,6 +482,7 @@ class BatchBuilder:
             "source_names",
             "prompt",
             "teacher_log_probs",
+            "metadata",
         ]
         if transport == "straw":
             from straw.protocol import digest

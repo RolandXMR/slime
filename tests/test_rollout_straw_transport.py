@@ -527,6 +527,7 @@ def test_train_partitions_preserve_top_p_and_multimodal(args, monkeypatch, trans
             raw_reward=[1.0, 2.0],
             rewards=[-1.0, 1.0],
             multimodal_train_inputs=[None, {"pixel_values": torch.ones(3, 20, 20)}],
+            metadata=[{"malformed_tool_call_spans": []}, {"malformed_tool_call_spans": [[1, 2]]}],
         )
     )
     assert len(sent) == 2
@@ -535,6 +536,7 @@ def test_train_partitions_preserve_top_p_and_multimodal(args, monkeypatch, trans
     assert batch["loss_masks"][0].tolist() == [0, 1]
     assert batch["total_lengths"] == [3]
     assert batch["local_raw_reward"] == [2.0]
+    assert batch["metadata"] == [{"malformed_tool_call_spans": [[1, 2]]}]
     assert batch["rollout_top_p_token_offsets"][0].tolist() == [0, 1, 2]
     torch.testing.assert_close(batch["rollout_top_p_log_probs"][0], torch.tensor([-0.3, -0.4]))
     assert batch["multimodal_train_inputs"][0]["pixel_values"].shape == (3, 20, 20)
