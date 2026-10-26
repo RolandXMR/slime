@@ -464,6 +464,8 @@ def forward_only(
         }
         if batch["multimodal_train_inputs"] is not None:
             forward_kwargs.update(batch["multimodal_train_inputs"])
+        if getattr(args, "keep_low_precision_logits", False):
+            forward_kwargs["fp32_output"] = False
         output_tensor = model(**forward_kwargs)
 
         output_kwargs = {
@@ -670,6 +672,8 @@ def train_one_step(
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
+            if getattr(args, "keep_low_precision_logits", False):
+                forward_kwargs["fp32_output"] = False
             output_tensor = model(**forward_kwargs)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":

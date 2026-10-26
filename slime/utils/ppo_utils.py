@@ -894,13 +894,16 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, logits, tokens, keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size):
+    def forward(ctx, logits, tokens, keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size, temperature):
         log_prob = torch.empty((logits.size(0), 1), device=logits.device, dtype=torch.float32)
         entropy = log_prob.new_empty((logits.size(0),) if with_entropy else (0,))
         for start in range(0, logits.size(0), chunk_size):
             end = min(start + chunk_size, logits.size(0))
+            work = logits[start:end].float()
+            if temperature != 1.0:
+                work = work / temperature
             values, entropies = _calculate_log_probs_and_entropy_chunk(
-                logits[start:end],
+                work,
                 tokens[start:end],
                 tp_group,
                 with_entropy=with_entropy,
@@ -914,6 +917,7 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
         ctx.tp_group = tp_group
         ctx.with_entropy_grad = with_entropy and with_entropy_grad
         ctx.chunk_size = chunk_size
+        ctx.temperature = temperature
         if not ctx.with_entropy_grad:
             ctx.mark_non_differentiable(entropy)
         return log_prob, entropy
@@ -926,9 +930,11 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
         for start in range(0, logits.size(0), ctx.chunk_size):
             end = min(start + ctx.chunk_size, logits.size(0))
             with torch.enable_grad():
-                chunk = logits[start:end].detach().requires_grad_()
+                # Accumulate normalization and temperature gradients in FP32,
+                # then round once when storing the returned input-dtype gradient.
+                chunk = logits[start:end].detach().float().requires_grad_()
                 values, entropies = _calculate_log_probs_and_entropy_chunk(
-                    chunk,
+                    chunk if ctx.temperature == 1.0 else chunk / ctx.temperature,
                     tokens[start:end],
                     ctx.tp_group,
                     with_entropy=ctx.with_entropy_grad,
@@ -942,7 +948,7 @@ class _ChunkedLogProbEntropy(torch.autograd.Function):
                 (gradient,) = torch.autograd.grad(outputs, chunk, grad_outputs=gradients)
             grad_input[start:end] = gradient
             del gradient, outputs, gradients, values, entropies, chunk
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None
 
 
 def calculate_log_probs_and_entropy(
@@ -953,19 +959,20 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     with_entropy_grad: bool = True,
+    temperature: float = 1.0,
 ):
     logits = logits.contiguous()
     entropy = None
     if logits.size(0) != 0:
         if chunk_size > 0:
             log_prob, entropy = _ChunkedLogProbEntropy.apply(
-                logits, tokens, log_prob_keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size
+                logits, tokens, log_prob_keep_mask, tp_group, with_entropy, with_entropy_grad, chunk_size, temperature
             )
             if not with_entropy:
                 entropy = None
         else:
             log_prob, entropy = _calculate_log_probs_and_entropy_chunk(
-                logits,
+                logits.float() if temperature == 1.0 else logits.float() / temperature,
                 tokens,
                 tp_group,
                 with_entropy=with_entropy,
@@ -973,8 +980,8 @@ def calculate_log_probs_and_entropy(
                 log_prob_keep_mask=log_prob_keep_mask,
             )
     else:
-        log_prob = logits.new_zeros((0,))
+        log_prob = torch.zeros((0,), device=logits.device, dtype=torch.float32)
         if with_entropy:
-            entropy = logits.new_zeros((0,))
+            entropy = log_prob.new_zeros((0,))
 
     return log_prob, entropy

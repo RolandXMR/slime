@@ -283,6 +283,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--keep-low-precision-logits",
+                action="store_true",
+                help="Keep model logits in BF16/FP16; compute log-probs and entropy in FP32 row chunks.",
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
@@ -2255,6 +2260,9 @@ def slime_validate_args(args):
             setattr(args, k, v)
             if k in getattr(args, "_load_fallback_options", {}):
                 args._load_fallback_options[k] = v
+
+    if getattr(args, "keep_low_precision_logits", False) and args.log_probs_chunk_size <= 0:
+        raise ValueError("--keep-low-precision-logits requires a positive --log-probs-chunk-size")
 
     if getattr(args, "fp32_lm_head", False):
         from slime.backends.megatron_utils.fp32_lm_head import validate_fp32_lm_head_config

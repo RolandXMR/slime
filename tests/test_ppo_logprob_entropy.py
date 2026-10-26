@@ -16,6 +16,43 @@ STRICT_ATOL = 1e-8
 STRICT_RTOL = 0.0
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+@pytest.mark.parametrize("with_mask", [False, True])
+@pytest.mark.parametrize("entropy_grad", [False, True])
+def test_low_precision_logits_match_fp32_normalization_and_gradient(dtype, temperature, with_mask, entropy_grad):
+    torch.manual_seed(71)
+    logits = torch.randn(13, 29).to(dtype).requires_grad_()
+    original = logits.detach().clone()
+    tokens = torch.arange(13) % 29
+    keep = torch.rand(13, 29) > 0.5 if with_mask else None
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(lambda value: saved.append(value) or value, lambda value: value):
+        logp, entropy = calculate_log_probs_and_entropy(
+            logits, tokens, None, with_entropy=True, with_entropy_grad=entropy_grad,
+            chunk_size=3, log_prob_keep_mask=keep, temperature=temperature,
+        )
+    # The large saved tensor stays in model precision, without an FP32 copy.
+    assert all(t.dtype != torch.float32 for t in saved if t.numel() == logits.numel())
+    assert logp.dtype == entropy.dtype == torch.float32
+    assert entropy.requires_grad == entropy_grad
+    weights = torch.linspace(-0.9, 1.1, 13)
+    (logp.squeeze(-1).mul(weights).sum() + (0.17 * entropy.sum() if entropy_grad else 0)).backward()
+
+    ref = original.float().requires_grad_()
+    scaled = ref / temperature
+    masked = scaled if keep is None else scaled.masked_fill(~keep, float("-inf")).scatter(
+        1, tokens[:, None], scaled.gather(1, tokens[:, None])
+    )
+    expected_logp = torch.log_softmax(masked, -1).gather(1, tokens[:, None])
+    expected_entropy = -(torch.softmax(scaled, -1) * torch.log_softmax(scaled, -1)).sum(-1)
+    (expected_logp.squeeze(-1).mul(weights).sum() + (0.17 * expected_entropy.sum() if entropy_grad else 0)).backward()
+    torch.testing.assert_close(logp, expected_logp, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(entropy, expected_entropy, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(logits.grad, ref.grad.to(dtype), atol=1e-6, rtol=0.002)
+    torch.testing.assert_close(logits, original, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("with_mask", [False, True])
 @pytest.mark.parametrize("with_entropy_grad", [False, True])
 def test_chunking_retains_inputs_without_full_vocab_softmax_buffers(with_mask, with_entropy_grad):
