@@ -27,6 +27,8 @@ RECOVERY_NAMESPACE = "slime-training-recovery"
 
 
 def training_recovery_enabled(args):
+    if getattr(args, "disable_training_recovery", False):
+        return False
     # Serving is always retained internally. Trainer replay additionally needs
     # durable batches, regardless of the legacy --use-fault-tolerance flag.
     replay_storage = (

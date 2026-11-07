@@ -68,6 +68,19 @@ def test_replay_persistence_is_independent_of_health_checks(args, transport, dum
     assert training_recovery_enabled(args) == enabled
 
 
+@pytest.mark.parametrize("transport", ["straw", "object-store"])
+def test_explicit_opt_out_preserves_rollout_dump_and_serving_settings(args, transport):
+    args.rollout_data_transport = transport
+    args.save_debug_rollout_data = "rollout_{rollout_id}.pt"
+    assert training_recovery_enabled(args)
+    args.disable_training_recovery = True
+    assert not training_recovery_enabled(args)
+    assert args.save_debug_rollout_data == "rollout_{rollout_id}.pt"
+    assert args.use_fault_tolerance is True
+    args.disable_training_recovery = False
+    assert training_recovery_enabled(args)
+
+
 @pytest.mark.parametrize("mode", ["debug_train_only", "debug_rollout_only", "load_debug_rollout_data"])
 def test_debug_only_modes_do_not_replay_training(args, mode):
     setattr(args, mode, True)

@@ -683,6 +683,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_fault_tolerance_arguments(parser):
             parser.add_argument(
+                "--disable-training-recovery",
+                action="store_true",
+                default=False,
+                help="Disable trainer checkpoint/replay recovery while preserving rollout dumps and serving health checks.",
+            )
+            parser.add_argument(
                 "--rollout-session-id",
                 type=str,
                 default=None,
